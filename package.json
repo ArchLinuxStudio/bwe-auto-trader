@@ -4,7 +4,7 @@
   "description": "Cross-platform BWEnews signal monitor and OKX trading desktop app",
   "main": "./out/main/index.js",
   "author": "ArchLinuxStudio",
-  "license": "UNLICENSED",
+  "license": "SEE LICENSE IN LICENSE",
   "private": true,
   "repository": {
     "type": "git",
@@ -63,7 +63,8 @@
     },
     "files": [
       "out/**/*",
-      "package.json"
+      "package.json",
+      "LICENSE"
     ],
     "win": {
       "target": [
