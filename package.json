@@ -1,0 +1,94 @@
+{
+  "name": "bwe-auto-trader",
+  "version": "0.1.5",
+  "description": "Cross-platform BWEnews signal monitor and OKX trading desktop app",
+  "main": "./out/main/index.js",
+  "author": "ArchLinuxStudio",
+  "license": "UNLICENSED",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArchLinuxStudio/bwe-auto-trader.git"
+  },
+  "homepage": "https://github.com/ArchLinuxStudio/bwe-auto-trader#readme",
+  "bugs": {
+    "url": "https://github.com/ArchLinuxStudio/bwe-auto-trader/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package:win": "npm run build && electron-builder --win nsis --x64",
+    "package:mac": "npm run build && electron-builder --mac dmg --x64 --arm64",
+    "package:linux": "npm run build && electron-builder --linux AppImage deb --x64",
+    "package:linux:arm64": "npm run build && electron-builder --linux AppImage deb --arm64"
+  },
+  "dependencies": {
+    "@openai/codex": "0.147.0",
+    "socks": "2.8.9",
+    "telegram": "2.26.22",
+    "ws": "8.21.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "vite": "7.3.6",
+    "vitest": "4.1.10"
+  },
+  "build": {
+    "appId": "com.local.bweautotrader",
+    "productName": "BWE Auto Trader",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/@openai/codex/**",
+      "node_modules/@openai/codex-*/**"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.finance",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Finance"
+    }
+  }
+}

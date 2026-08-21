@@ -1,0 +1,33 @@
+node_modules/
+out/
+release/
+coverage/
+*.log
+vite-qa.*.log
+*.local
+.env*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Local credentials and package-manager authentication
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+secrets.v1.json
+settings.v1.json
+
+# Telegram/runtime sessions and local application state
+*.session
+*.session-journal
+user-data/
+user-data-*/
+qa-user-data*/
+audit/
+
+# Temporary review and QA directories
+.tmp*/
+.tmp-*/
