@@ -2,6 +2,7 @@ export interface TelegramRawMessageLike {
   id?: number
   message?: string
   text?: string
+  richText?: string
   date?: number | Date
   media?: unknown
   postAuthor?: string
@@ -12,6 +13,7 @@ export interface TelegramMessageContext {
   channelId?: string
   channelTitle?: string
   receivedAt?: Date
+  recovered?: boolean
 }
 
 export interface TelegramSignalMessage {
@@ -26,6 +28,7 @@ export interface TelegramSignalMessage {
   hasMedia: boolean
   mediaKind?: string
   postAuthor?: string
+  recovered: boolean
 }
 
 export interface TelegramMessagePayloadLike {
@@ -36,9 +39,11 @@ export interface TelegramMessagePayloadLike {
   date: number
   receivedAt: number
   permalink?: string
+  recovered?: boolean
 }
 
 const EMPTY_MEDIA_KINDS = new Set(['MessageMediaEmpty'])
+const MAX_TELEGRAM_FUTURE_SKEW_MS = 5 * 60 * 1_000
 
 export function normalizeTelegramUsername(username: string): string {
   return username.trim().replace(/^https?:\/\/t\.me\//i, '').replace(/^@/, '').replace(/\/$/, '')
@@ -60,8 +65,12 @@ export function extractTelegramSignalMessage(
   // that through Number.isSafeInteger for an optional number.
   const validMessageId = messageId as number
 
-  // In GramJS, `message` contains both a normal post body and a media caption.
-  const text = normalizeMessageText(raw.message ?? raw.text ?? '')
+  // In teleproto, `message` contains both a normal post body and a media
+  // caption. Layer 228 rich messages expose a plain rendering as `richText`;
+  // use that local rendering without an extra fetch so signal latency stays low.
+  const text = [raw.message, raw.text, raw.richText]
+    .map((value) => normalizeMessageText(value ?? ''))
+    .find(Boolean) ?? ''
   if (!text) {
     return null
   }
@@ -71,8 +80,17 @@ export function extractTelegramSignalMessage(
     return null
   }
 
-  const publishedAt = normalizePublishedAt(raw.date)
   const receivedAt = context.receivedAt ?? new Date()
+  if (!Number.isFinite(receivedAt.getTime())) {
+    return null
+  }
+  const publishedAt = normalizePublishedAt(raw.date)
+  if (
+    !publishedAt ||
+    publishedAt.getTime() > receivedAt.getTime() + MAX_TELEGRAM_FUTURE_SKEW_MS
+  ) {
+    return null
+  }
   const mediaKind = readMediaKind(raw.media)
 
   return {
@@ -87,6 +105,7 @@ export function extractTelegramSignalMessage(
     hasMedia: Boolean(mediaKind),
     mediaKind,
     postAuthor: normalizeOptionalString(raw.postAuthor),
+    recovered: context.recovered ?? false,
   }
 }
 
@@ -140,6 +159,7 @@ export function toTelegramMessagePayload(
     date: Date.parse(message.publishedAt),
     receivedAt: Date.parse(message.receivedAt),
     permalink: message.url,
+    recovered: message.recovered,
   }
 }
 
@@ -152,15 +172,17 @@ function normalizeOptionalString(value: string | undefined): string | undefined 
   return normalized || undefined
 }
 
-function normalizePublishedAt(value: number | Date | undefined): Date {
+function normalizePublishedAt(value: number | Date | undefined): Date | undefined {
   if (value instanceof Date && Number.isFinite(value.getTime())) {
     return value
   }
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    // GramJS represents Telegram dates as Unix seconds.
-    return new Date(value * 1_000)
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    // teleproto represents Telegram dates as Unix seconds. The future-skew
+    // check above also fails closed if milliseconds are supplied by mistake.
+    const date = new Date(value * 1_000)
+    return Number.isFinite(date.getTime()) ? date : undefined
   }
-  return new Date()
+  return undefined
 }
 
 function readMediaKind(media: unknown): string | undefined {

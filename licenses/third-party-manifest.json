@@ -1,0 +1,450 @@
+{
+  "schemaVersion": 1,
+  "appVersion": "0.1.6",
+  "noticesPath": "THIRD_PARTY_NOTICES.txt",
+  "scope": "Production dependency closure for supported win32, darwin, and linux x64/arm64 packages. Exactly one platform-specific @openai/codex package is selected for a built target.",
+  "packages": [
+    {
+      "lockPath": "node_modules/@openai/codex",
+      "packageName": "@openai/codex",
+      "actualName": "@openai/codex",
+      "version": "0.147.0",
+      "license": "Apache-2.0",
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex@0.147.0"
+    },
+    {
+      "lockPath": "node_modules/@openai/codex-darwin-arm64",
+      "packageName": "@openai/codex-darwin-arm64",
+      "actualName": "@openai/codex",
+      "version": "0.147.0-darwin-arm64",
+      "license": "Apache-2.0",
+      "platforms": [
+        "darwin"
+      ],
+      "architectures": [
+        "arm64"
+      ],
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex-darwin-arm64@0.147.0-darwin-arm64"
+    },
+    {
+      "lockPath": "node_modules/@openai/codex-darwin-x64",
+      "packageName": "@openai/codex-darwin-x64",
+      "actualName": "@openai/codex",
+      "version": "0.147.0-darwin-x64",
+      "license": "Apache-2.0",
+      "platforms": [
+        "darwin"
+      ],
+      "architectures": [
+        "x64"
+      ],
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex-darwin-x64@0.147.0-darwin-x64"
+    },
+    {
+      "lockPath": "node_modules/@openai/codex-linux-arm64",
+      "packageName": "@openai/codex-linux-arm64",
+      "actualName": "@openai/codex",
+      "version": "0.147.0-linux-arm64",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "arm64"
+      ],
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex-linux-arm64@0.147.0-linux-arm64"
+    },
+    {
+      "lockPath": "node_modules/@openai/codex-linux-x64",
+      "packageName": "@openai/codex-linux-x64",
+      "actualName": "@openai/codex",
+      "version": "0.147.0-linux-x64",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64"
+      ],
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex-linux-x64@0.147.0-linux-x64"
+    },
+    {
+      "lockPath": "node_modules/@openai/codex-win32-arm64",
+      "packageName": "@openai/codex-win32-arm64",
+      "actualName": "@openai/codex",
+      "version": "0.147.0-win32-arm64",
+      "license": "Apache-2.0",
+      "platforms": [
+        "win32"
+      ],
+      "architectures": [
+        "arm64"
+      ],
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex-win32-arm64@0.147.0-win32-arm64"
+    },
+    {
+      "lockPath": "node_modules/@openai/codex-win32-x64",
+      "packageName": "@openai/codex-win32-x64",
+      "actualName": "@openai/codex",
+      "version": "0.147.0-win32-x64",
+      "license": "Apache-2.0",
+      "platforms": [
+        "win32"
+      ],
+      "architectures": [
+        "x64"
+      ],
+      "evidence": [
+        "openai-codex-license",
+        "openai-codex-notice"
+      ],
+      "noticeToken": "@openai/codex-win32-x64@0.147.0-win32-x64"
+    },
+    {
+      "lockPath": "node_modules/big-integer",
+      "packageName": "big-integer",
+      "actualName": "big-integer",
+      "version": "1.6.52",
+      "license": "Unlicense",
+      "evidence": [
+        "big-integer-license"
+      ],
+      "noticeToken": "big-integer@1.6.52"
+    },
+    {
+      "lockPath": "node_modules/graceful-fs",
+      "packageName": "graceful-fs",
+      "actualName": "graceful-fs",
+      "version": "4.2.11",
+      "license": "ISC",
+      "evidence": [
+        "graceful-fs-license"
+      ],
+      "noticeToken": "graceful-fs@4.2.11"
+    },
+    {
+      "lockPath": "node_modules/imurmurhash",
+      "packageName": "imurmurhash",
+      "actualName": "imurmurhash",
+      "version": "0.1.4",
+      "license": "MIT",
+      "evidence": [
+        "imurmurhash-license"
+      ],
+      "noticeToken": "imurmurhash@0.1.4"
+    },
+    {
+      "lockPath": "node_modules/ip-address",
+      "packageName": "ip-address",
+      "actualName": "ip-address",
+      "version": "10.5.0",
+      "license": "MIT",
+      "evidence": [
+        "ip-address-license"
+      ],
+      "noticeToken": "ip-address@10.5.0"
+    },
+    {
+      "lockPath": "node_modules/node-localstorage",
+      "packageName": "node-localstorage",
+      "actualName": "node-localstorage",
+      "version": "2.2.1",
+      "license": "MIT",
+      "evidence": [
+        "node-localstorage-license"
+      ],
+      "noticeToken": "node-localstorage@2.2.1"
+    },
+    {
+      "lockPath": "node_modules/slide",
+      "packageName": "slide",
+      "actualName": "slide",
+      "version": "1.1.6",
+      "license": "ISC",
+      "evidence": [
+        "slide-license"
+      ],
+      "noticeToken": "slide@1.1.6"
+    },
+    {
+      "lockPath": "node_modules/smart-buffer",
+      "packageName": "smart-buffer",
+      "actualName": "smart-buffer",
+      "version": "4.2.0",
+      "license": "MIT",
+      "evidence": [
+        "smart-buffer-license"
+      ],
+      "noticeToken": "smart-buffer@4.2.0"
+    },
+    {
+      "lockPath": "node_modules/socks",
+      "packageName": "socks",
+      "actualName": "socks",
+      "version": "2.8.9",
+      "license": "MIT",
+      "evidence": [
+        "socks-license"
+      ],
+      "noticeToken": "socks@2.8.9"
+    },
+    {
+      "lockPath": "node_modules/store2",
+      "packageName": "store2",
+      "actualName": "store2",
+      "version": "2.14.4",
+      "license": "MIT",
+      "evidence": [
+        "store2-mit-selection"
+      ],
+      "noticeToken": "store2@2.14.4"
+    },
+    {
+      "lockPath": "node_modules/teleproto",
+      "packageName": "teleproto",
+      "actualName": "teleproto",
+      "version": "1.228.5",
+      "license": "MIT",
+      "evidence": [
+        "teleproto-license"
+      ],
+      "noticeToken": "teleproto@1.228.5"
+    },
+    {
+      "lockPath": "node_modules/teleproto/node_modules/mime",
+      "packageName": "mime",
+      "actualName": "mime",
+      "version": "3.0.0",
+      "license": "MIT",
+      "evidence": [
+        "mime-license"
+      ],
+      "noticeToken": "mime@3.0.0"
+    },
+    {
+      "lockPath": "node_modules/write-file-atomic",
+      "packageName": "write-file-atomic",
+      "actualName": "write-file-atomic",
+      "version": "1.3.4",
+      "license": "ISC",
+      "evidence": [
+        "write-file-atomic-license"
+      ],
+      "noticeToken": "write-file-atomic@1.3.4"
+    },
+    {
+      "lockPath": "node_modules/ws",
+      "packageName": "ws",
+      "actualName": "ws",
+      "version": "8.21.3",
+      "license": "MIT",
+      "evidence": [
+        "ws-license"
+      ],
+      "noticeToken": "ws@8.21.3"
+    },
+    {
+      "lockPath": "node_modules/zod",
+      "packageName": "zod",
+      "actualName": "zod",
+      "version": "4.4.3",
+      "license": "MIT",
+      "evidence": [
+        "zod-license"
+      ],
+      "noticeToken": "zod@4.4.3"
+    }
+  ],
+  "runtimeComponents": [
+    {
+      "name": "Electron",
+      "version": "43.4.0",
+      "chromiumVersion": "150.0.7871.224",
+      "nodeVersion": "24.18.1",
+      "target": "win32-x64",
+      "platforms": [
+        "win32"
+      ],
+      "architectures": [
+        "x64"
+      ],
+      "source": "https://github.com/electron/electron/tree/v43.4.0",
+      "release": "https://github.com/electron/electron/releases/tag/v43.4.0",
+      "binaryArchive": "electron-v43.4.0-win32-x64.zip",
+      "binaryArchiveSha256": "EF0709CFA719739ACCE73DE6F9B684304BAF38C6454376638A70D34A7CECFFE0",
+      "ffmpegArchive": "ffmpeg-v43.4.0-win32-x64.zip",
+      "ffmpegArchiveSha256": "EB12E776D9580688D99B83F54E2CEBAA729B06F78DABE639DF73F14A067ED9BF",
+      "licenseFiles": [
+        {
+          "packagedPath": "LICENSE.electron.txt",
+          "sourcePath": "node_modules/electron/dist/LICENSE",
+          "sha256": "5154E165BD6C2CC0CFBCD8916498C7ABAB0497923BAFCD5CB07673FE8480087D"
+        },
+        {
+          "packagedPath": "LICENSES.chromium.html",
+          "sourcePath": "node_modules/electron/dist/LICENSES.chromium.html",
+          "sha256": "B911161E6594EC76B872498B423C54406168F2974E0D407A847F7DE1E5FF94DD"
+        }
+      ],
+      "sourceProvenance": [
+        "https://chromium.googlesource.com/chromium/src/+/150.0.7871.224",
+        "https://github.com/electron/electron/blob/v43.4.0/docs/development/build-instructions-gn.md"
+      ],
+      "licenseBoundary": "Electron is MIT, while Chromium and its bundled components use many independent licenses. LICENSES.chromium.html includes LGPL-2.1-or-later components such as FFmpeg. These runtime rights are not restricted by the BWE Auto Trader project license."
+    }
+  ],
+  "evidence": [
+    {
+      "id": "big-integer-license",
+      "kind": "license",
+      "path": "licenses/third-party/big-integer-1.6.52-Unlicense.txt",
+      "sha256": "60D2C28D19D2BDF7BBAA59829E7A595234265E8111A01CCB74D25D6C4D2D013A",
+      "sourceType": "package-file",
+      "source": "node_modules/big-integer/LICENSE"
+    },
+    {
+      "id": "graceful-fs-license",
+      "kind": "license",
+      "path": "licenses/third-party/graceful-fs-4.2.11-ISC.txt",
+      "sha256": "C8302C110C20E0D7E5C60CD2DF3C29D9D5AB66DEBD9967AAC2B5924410B8B98A",
+      "sourceType": "package-file",
+      "source": "node_modules/graceful-fs/LICENSE"
+    },
+    {
+      "id": "imurmurhash-license",
+      "kind": "license",
+      "path": "licenses/third-party/imurmurhash-0.1.4-MIT.txt",
+      "sha256": "F9E9899DD7E3EF4F324AE0330186A369281D76E980773A83798209D81A51B498",
+      "sourceType": "upstream-tag",
+      "source": "https://raw.githubusercontent.com/jensyt/imurmurhash-js/0.1.4/LICENSE"
+    },
+    {
+      "id": "ip-address-license",
+      "kind": "license",
+      "path": "licenses/third-party/ip-address-10.5.0-MIT.txt",
+      "sha256": "BEFFE481B7BFD59FEBEBFB101D510BBA50A91AC446947E6BDCEED9A241B7171E",
+      "sourceType": "package-file",
+      "source": "node_modules/ip-address/LICENSE"
+    },
+    {
+      "id": "mime-license",
+      "kind": "license",
+      "path": "licenses/third-party/mime-3.0.0-MIT.txt",
+      "sha256": "C3FE00E171C1C8E29C8C4BB5E3FCBFF97C75841F54E0D37F835527779E02E727",
+      "sourceType": "package-file",
+      "source": "node_modules/teleproto/node_modules/mime/LICENSE"
+    },
+    {
+      "id": "node-localstorage-license",
+      "kind": "license",
+      "path": "licenses/third-party/node-localstorage-2.2.1-MIT.txt",
+      "sha256": "C469A292295145330B11DA0DEFE7195D3DA1CE0049961B5D2BE11AD5746A5EA7",
+      "sourceType": "package-file",
+      "source": "node_modules/node-localstorage/LICENSE.md"
+    },
+    {
+      "id": "openai-codex-license",
+      "kind": "license",
+      "path": "licenses/third-party/openai-codex-0.147.0-LICENSE.txt",
+      "sha256": "FADA9CDA895B67AF092F74F75BA23230E8D4EEEF3D06AF394A1DC79093D10787",
+      "sourceType": "upstream-tag",
+      "source": "https://raw.githubusercontent.com/openai/codex/rust-v0.147.0/LICENSE"
+    },
+    {
+      "id": "openai-codex-notice",
+      "kind": "notice",
+      "path": "licenses/third-party/openai-codex-0.147.0-NOTICE.txt",
+      "sha256": "8B6DB9C66BC81DBA23BA1E4CD255BF9F2A1F799F532D97C1EF310F5E379407D7",
+      "sourceType": "upstream-tag",
+      "source": "https://raw.githubusercontent.com/openai/codex/rust-v0.147.0/NOTICE"
+    },
+    {
+      "id": "slide-license",
+      "kind": "license",
+      "path": "licenses/third-party/slide-1.1.6-ISC.txt",
+      "sha256": "5F61DCFFAF8A5EED4A2855205D46745F024B1F3BE67EFFD661EB3EB4ABF156D7",
+      "sourceType": "package-file",
+      "source": "node_modules/slide/LICENSE"
+    },
+    {
+      "id": "smart-buffer-license",
+      "kind": "license",
+      "path": "licenses/third-party/smart-buffer-4.2.0-MIT.txt",
+      "sha256": "543EEC7DBE67173F6C2CFC1773135698569ABE3192FCD620D07334954AD0FFA1",
+      "sourceType": "package-file",
+      "source": "node_modules/smart-buffer/LICENSE"
+    },
+    {
+      "id": "socks-license",
+      "kind": "license",
+      "path": "licenses/third-party/socks-2.8.9-MIT.txt",
+      "sha256": "5FD2BF9F5A79CD0CF589365D6A05515D393CED770C8D872BF32858745F5EFC21",
+      "sourceType": "package-file",
+      "source": "node_modules/socks/LICENSE"
+    },
+    {
+      "id": "store2-mit-selection",
+      "kind": "license",
+      "path": "licenses/third-party/store2-2.14.4-MIT.txt",
+      "sha256": "830081B6967CDC06511D221AB33A542F305C5F6B72A39EE4A4C18B162820DC5E",
+      "sourceType": "reviewed-license-selection",
+      "source": "package.json MIT declaration plus dist/store2.js and src/store2.js notices"
+    },
+    {
+      "id": "teleproto-license",
+      "kind": "license",
+      "path": "licenses/third-party/teleproto-1.228.5-MIT.txt",
+      "sha256": "E0B8D4D718EB14B119E6D765EF823C930301B3D109BA7A3FFD90830039EBE7F7",
+      "sourceType": "package-file",
+      "source": "node_modules/teleproto/LICENSE"
+    },
+    {
+      "id": "write-file-atomic-license",
+      "kind": "license",
+      "path": "licenses/third-party/write-file-atomic-1.3.4-ISC.txt",
+      "sha256": "EA7F376FE7A1FC28572B83AC8F806D92EFFB31852B9981BC9BA9D5266CAA6B28",
+      "sourceType": "package-file",
+      "source": "node_modules/write-file-atomic/LICENSE"
+    },
+    {
+      "id": "ws-license",
+      "kind": "license",
+      "path": "licenses/third-party/ws-8.21.3-MIT.txt",
+      "sha256": "97A16DF1C640CE24B55B4DCE457CE3BD56086597023E31997AA51BD5989C4CEA",
+      "sourceType": "package-file",
+      "source": "node_modules/ws/LICENSE"
+    },
+    {
+      "id": "zod-license",
+      "kind": "license",
+      "path": "licenses/third-party/zod-4.4.3-MIT.txt",
+      "sha256": "A159A31226EE8A2F68C26B3E4903DD4E7336900EA5426C6F5F5FF96BBE8701F9",
+      "sourceType": "package-file",
+      "source": "node_modules/zod/LICENSE"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "approvedLicenses": [
+    "Apache-2.0",
+    "ISC",
+    "MIT",
+    "Unlicense"
+  ],
+  "forbiddenPackages": [
+    "@cryptography/aes",
+    "telegram"
+  ],
+  "requiredPackages": {
+    "teleproto": {
+      "version": "1.228.5",
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/teleproto/-/teleproto-1.228.5.tgz",
+      "integrity": "sha512-NMBFB4oB+0mjJIPVqdLd3wAaU7kf5dw7frrYdnnXM38DSdbnN36Dao6Ae1xNZR9NICiefbfJqM8yDijOPqE8MA==",
+      "licenseSha256": "489C66171C6826F62A58B5F4A14DDFF3111F530AE40542F61C15CF341ACC1D7D"
+    }
+  }
+}

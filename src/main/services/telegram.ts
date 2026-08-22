@@ -2,12 +2,15 @@ import { EventEmitter } from 'node:events'
 import { Buffer } from 'node:buffer'
 import net, { type Socket } from 'node:net'
 
-import { TelegramClient } from 'telegram'
-import { NewMessage, type NewMessageEvent } from 'telegram/events/index.js'
-import { ConnectionTCPFull } from 'telegram/network/connection/index.js'
-import { StringSession } from 'telegram/sessions/index.js'
-import type { Api } from 'telegram'
-import type { PromisedNetSockets } from 'telegram/extensions/index.js'
+import { TelegramClient } from 'teleproto'
+import { NewMessage, Raw, type NewMessageEvent } from 'teleproto/events/index.js'
+import { UpdateConnectionState } from 'teleproto/network/index.js'
+import { ConnectionTCPFull } from 'teleproto/network/connection/index.js'
+import { StringSession } from 'teleproto/sessions/index.js'
+import type { Api } from 'teleproto'
+import type { SocketInterface } from 'teleproto/extensions/index.js'
+import type { TelegramClientParams } from 'teleproto/client/telegramBaseClient.js'
+import type { SignalTradeAuthorizationToken } from './signal-coordinator'
 
 import {
   BoundedMessageDeduplicator,
@@ -50,7 +53,7 @@ export interface TelegramAuthCallbacks {
   phoneNumber?: string | (() => Promise<string>)
   phoneCode?: (isCodeViaApp?: boolean) => Promise<string>
   password?: (hint?: string) => Promise<string>
-  /** Return true to abort GramJS' authentication retry loop. */
+  /** Return true to abort teleproto's authentication retry loop. */
   onError?: (error: Error) => boolean | void | Promise<boolean | void>
 }
 
@@ -83,7 +86,10 @@ export interface TelegramIgnoredMessage {
 }
 
 export interface TelegramMonitorCallbacks {
-  onMessage?: (message: TelegramSignalMessage) => void | Promise<void>
+  onMessage?: (
+    message: TelegramSignalMessage,
+    context: TelegramMessageDispatchContext,
+  ) => void | Promise<void>
   onStatus?: (status: TelegramStatusEvent) => void | Promise<void>
   onAuthRequired?: (request: TelegramAuthRequest) => void | Promise<void>
   onError?: (error: TelegramMonitorError) => void | Promise<void>
@@ -96,6 +102,12 @@ export interface TelegramMonitorOptions {
   secretStore: TelegramSecretStore
   auth?: TelegramAuthCallbacks
   callbacks?: TelegramMonitorCallbacks
+  /**
+   * Captures the controller's process-local live-trading capability in the
+   * synchronous NewMessage event turn, before any Telegram FIFO or callback
+   * scheduling delay. Throwing or returning undefined fails closed.
+   */
+  captureAuthorization?: () => SignalTradeAuthorizationToken | undefined
   channel?: string
   proxy?: TelegramProxyConfig | false
   sessionSecretKey?: string
@@ -105,6 +117,16 @@ export interface TelegramMonitorOptions {
   healthCheckIntervalMs?: number
   catchUpLimit?: number
   deduplicationCapacity?: number
+  stopDrainTimeoutMs?: number
+}
+
+export interface TelegramLiveTradingReadiness {
+  ready: boolean
+  revision: number
+}
+
+export interface TelegramMessageDispatchContext {
+  readonly authorizationToken?: SignalTradeAuthorizationToken
 }
 
 interface TelegramEventMap {
@@ -119,6 +141,10 @@ interface QueuedTelegramMessage {
   raw: Api.Message
   /** Local wall-clock time at which this update entered our transport queue. */
   receivedAt: Date
+  /** Recovery/startup replay may be analyzed and displayed, but never traded. */
+  recovered: boolean
+  /** Authorization as it existed when the raw live update entered the process. */
+  authorizationToken?: SignalTradeAuthorizationToken
 }
 
 const DEFAULT_CHANNEL = 'BWEnews'
@@ -126,16 +152,27 @@ const DEFAULT_SESSION_KEY = 'telegram.string-session'
 const DEFAULT_PROXY_HOST = '127.0.0.1'
 const DEFAULT_PROXY_PORT = 7890
 const DISCONNECT_CONFIRMATION_CHECKS = 2
+const MAX_RECOVERY_BUFFER_MESSAGES = 5_000
+const DEFAULT_STOP_DRAIN_TIMEOUT_MS = 2_000
 
 export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private client?: TelegramClient
   private channelEntity?: Api.TypeUser | Api.TypeChat
   private eventBuilder?: NewMessage
   private eventHandler?: (event: NewMessageEvent) => Promise<void>
+  private connectionEventBuilder?: Raw
+  private connectionEventHandler?: (event: unknown) => void
   private healthTimer?: NodeJS.Timeout
+  private recoveryConfirmationTimer?: NodeJS.Timeout
+  private healthCheckPromise?: Promise<void>
   private startPromise?: Promise<void>
   private stopRequested = false
   private reconnecting = false
+  private recoveryPending = false
+  private recoveryPromise?: Promise<void>
+  private recoveryRevision = 0
+  private recoveryMessageBuffer: QueuedTelegramMessage[] = []
+  private recoveryBufferOverflow = false
   private disconnectedChecks = 0
   private startupBaselineId = 0
   private lastSeenMessageId = 0
@@ -164,7 +201,20 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   }
 
   get connected(): boolean {
-    return Boolean(this.client?.connected && this.stateValue === 'connected')
+    return this.liveTradingReadiness.ready
+  }
+
+  get liveTradingReadiness(): TelegramLiveTradingReadiness {
+    return {
+      ready: Boolean(
+        this.client?.connected &&
+        this.stateValue === 'connected' &&
+        !this.recoveryPending &&
+        !this.reconnecting &&
+        !this.recoveryPromise,
+      ),
+      revision: this.recoveryRevision,
+    }
   }
 
   get channelUsername(): string {
@@ -179,7 +229,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     if (this.startPromise) {
       return this.startPromise
     }
-    if (this.client && this.client.connected) {
+    if (this.connected) {
       return Promise.resolve()
     }
 
@@ -209,25 +259,48 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.authBroker.cancel('Telegram monitor stopped')
     this.setState('stopping')
     this.clearHealthTimer()
+    this.clearRecoveryConfirmationTimer()
 
     const client = this.client
     if (client && this.eventBuilder && this.eventHandler) {
       client.removeEventHandler(this.eventHandler, this.eventBuilder)
     }
-
-    await this.processingTail.catch(() => undefined)
-    await this.awaitMessageDispatches()
-    await this.persistSession().catch((error) => this.reportError(error, false))
-    if (client) {
-      await client.destroy().catch((error) => this.reportError(error, false))
+    if (client && this.connectionEventBuilder && this.connectionEventHandler) {
+      client.removeEventHandler(this.connectionEventHandler, this.connectionEventBuilder)
     }
+
+    const healthCheckToDrain = this.healthCheckPromise
+    const recoveryToDrain = this.recoveryPromise
+    const drains: Promise<unknown>[] = [
+      this.processingTail.catch(() => undefined),
+      this.awaitMessageDispatches(),
+      this.persistSession().catch((error) => this.reportError(error, false)),
+    ]
+    if (client) drains.push(client.destroy().catch((error) => this.reportError(error, false)))
+    if (healthCheckToDrain) drains.push(healthCheckToDrain.catch(() => undefined))
+    if (recoveryToDrain) drains.push(recoveryToDrain.catch(() => undefined))
+    // Start destroy immediately, then bound the whole drain. A broken injected
+    // callback or a TCP dial that ignores destroy must not make Stop hang
+    // forever; stopRequested and the controller's synchronous disarm remain the
+    // authoritative fail-closed gates for any task that finishes later.
+    await settleWithin(
+      Promise.allSettled(drains).then(() => undefined),
+      this.options.stopDrainTimeoutMs ?? DEFAULT_STOP_DRAIN_TIMEOUT_MS,
+    )
 
     this.client = undefined
     this.channelEntity = undefined
     this.eventBuilder = undefined
     this.eventHandler = undefined
+    this.connectionEventBuilder = undefined
+    this.connectionEventHandler = undefined
     this.activeProxyProtocol = undefined
     this.reconnecting = false
+    this.recoveryPending = false
+    this.recoveryPromise = undefined
+    this.recoveryRevision = 0
+    this.recoveryMessageBuffer = []
+    this.recoveryBufferOverflow = false
     this.disconnectedChecks = 0
     this.recoveryFromMessageId = undefined
     this.bufferingInitialMessages = false
@@ -258,10 +331,18 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
 
   private async startInternal(): Promise<void> {
     this.stopRequested = false
+    this.clearRecoveryConfirmationTimer()
     this.authBroker = new AuthPromptBroker((request) => this.notifyAuthRequired(request))
     this.deduplicator.clear()
     this.startupBaselineId = 0
     this.lastSeenMessageId = 0
+    this.reconnecting = false
+    this.recoveryPending = false
+    this.recoveryPromise = undefined
+    this.recoveryRevision = 0
+    this.recoveryMessageBuffer = []
+    this.recoveryBufferOverflow = false
+    this.disconnectedChecks = 0
     this.recoveryFromMessageId = undefined
     this.bufferingInitialMessages = false
     this.initialMessageBuffer = []
@@ -287,41 +368,49 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
 
       this.bufferingInitialMessages = true
       this.eventBuilder = new NewMessage({ chats: [this.channelEntity], incoming: true })
-      this.eventHandler = async (event) => {
-        // Capture this before any ordered processing. A slow AI request for an
-        // earlier post must never make a later Telegram update look newer than
-        // it really is.
-        const queuedMessage: QueuedTelegramMessage = {
-          raw: event.message,
-          receivedAt: new Date(),
-        }
-        if (this.bufferingInitialMessages) {
-          this.initialMessageBuffer.push(queuedMessage)
-          return
-        }
-        void this.enqueueRawMessage(queuedMessage.raw, queuedMessage.receivedAt)
-      }
+      this.eventHandler = (event) => this.handleNewMessageEvent(event)
       this.client.addEventHandler(this.eventHandler, this.eventBuilder)
 
-      // Close the small race between reading the baseline and registering the handler.
-      await this.catchUpMessages(this.startupBaselineId)
-      const bufferedMessages = this.initialMessageBuffer.sort(
-        (left, right) => left.raw.id - right.raw.id,
-      )
+      // Close the small race between reading the baseline and registering the
+      // handler. Collect the whole range before dispatching anything so a
+      // later-page failure cannot leak a partial recovery into trading.
+      const caughtUpMessages = await this.collectCatchUpMessages(this.startupBaselineId)
+      this.installConnectionStateHandler(this.client)
+      const startupConnectionRevision = this.recoveryRevision
+      await this.persistSession()
+      const startupAuthorized = this.client.connected && (await this.client.checkAuthorization())
+      if (
+        !startupAuthorized ||
+        !this.client.connected ||
+        this.recoveryPending ||
+        this.recoveryRevision !== startupConnectionRevision
+      ) {
+        throw new Error('Telegram session is not connected and authorized after startup')
+      }
+
+      // Finish readiness and open the initial buffer in one synchronous turn.
+      // This prevents a post from reaching the controller before the monitor
+      // has actually published its connected state.
+      const bufferedMessages = this.initialMessageBuffer
       this.initialMessageBuffer = []
       this.bufferingInitialMessages = false
-      for (const message of bufferedMessages) {
-        void this.enqueueRawMessage(message.raw, message.receivedAt)
-      }
-      await this.processingTail
-      await this.persistSession()
       this.setState('connected', `Listening to @${this.channelUsername}`)
       this.startHealthTimer()
+      for (const message of mergeQueuedMessages(caughtUpMessages, bufferedMessages)) {
+        void this.enqueueRawMessage(
+          message.raw,
+          message.receivedAt,
+          message.recovered,
+          message.authorizationToken,
+        )
+      }
+      await this.processingTail
     } catch (cause) {
       if (this.stopRequested) {
         return
       }
       this.setState('error', errorMessage(cause))
+      this.clearRecoveryConfirmationTimer()
       await this.reportError(cause, false)
       const failedClient = this.client
       this.client = undefined
@@ -344,7 +433,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       try {
         client.onError = async (error) => {
           if (!this.stopRequested) {
-            // GramJS uses this as a generic recoverable error hook, not as a
+            // teleproto uses this as a generic recoverable error hook, not as a
             // definitive transport-close event. Let the health checker own
             // connection-state transitions so a harmless RPC/keepalive error
             // cannot revoke live authorization by itself.
@@ -403,8 +492,10 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       connectionRetries: this.options.connectionRetries ?? 5,
       reconnectRetries: this.options.reconnectRetries ?? 5,
       retryDelay: this.options.reconnectDelayMs ?? 1_000,
-      autoReconnect: true,
-      useWSS: false,
+      // The application owns reconnect/catch-up sequencing. Letting teleproto
+      // reconnect in parallel can expose residual updates before our cursor is
+      // verified and can race a manual client.connect() call.
+      autoReconnect: false,
       ...(useProxy
         ? {
             proxy: {
@@ -418,9 +509,9 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
           }
         : {}),
       ...(useProxy && proxyProtocol === 'http'
-        ? { networkSocket: HttpConnectSocket as unknown as typeof PromisedNetSockets }
+        ? { networkSocket: HttpConnectSocket }
         : {}),
-    }
+    } satisfies TelegramClientParams
 
     return new TelegramClient(
       new StringSession(storedSession),
@@ -462,30 +553,67 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private enqueueRawMessage(
     raw: Api.Message,
     receivedAt = new Date(),
-    verifiedRecovery = false,
+    recovered = false,
+    authorizationToken?: SignalTradeAuthorizationToken,
   ): Promise<void> {
+    if (this.recoveryPending || this.reconnecting) {
+      this.bufferRecoveryMessage(raw, receivedAt, authorizationToken)
+      return Promise.resolve()
+    }
+
     const operation = this.processingTail.then(() =>
-      this.processRawMessage(raw, receivedAt, verifiedRecovery),
+      this.processRawMessage(raw, receivedAt, recovered, authorizationToken),
     )
     this.processingTail = operation.catch((error) => this.reportError(error, true))
     return operation
   }
 
+  private async handleNewMessageEvent(event: NewMessageEvent): Promise<void> {
+    // This must remain the first synchronous operation in the raw event
+    // callback. A later arm/re-arm must never authorize an update that was
+    // already received while locked or under an older capability epoch.
+    let authorizationToken: SignalTradeAuthorizationToken | undefined
+    try {
+      authorizationToken = this.options.captureAuthorization?.()
+    } catch (error) {
+      void this.reportError(error, true)
+    }
+    // Capture this before any ordered processing. A slow AI request for an
+    // earlier post must never make a later Telegram update look newer than it
+    // really is.
+    const queuedMessage: QueuedTelegramMessage = {
+      raw: event.message,
+      receivedAt: new Date(),
+      recovered: this.bufferingInitialMessages || this.recoveryPending || this.reconnecting,
+      authorizationToken,
+    }
+    if (this.bufferingInitialMessages) {
+      this.initialMessageBuffer.push(queuedMessage)
+      return
+    }
+    void this.enqueueRawMessage(
+      queuedMessage.raw,
+      queuedMessage.receivedAt,
+      queuedMessage.recovered,
+      queuedMessage.authorizationToken,
+    )
+  }
+
   private async processRawMessage(
     raw: Api.Message,
     receivedAt: Date,
-    verifiedRecovery: boolean,
+    recovered: boolean,
+    authorizationToken?: SignalTradeAuthorizationToken,
   ): Promise<void> {
     if (this.stopRequested) {
       return
     }
 
-    // A single negative `client.connected` sample is treated as a suspected
-    // outage until the next health check. Do not dispatch updates from
-    // GramJS' residual queue during that window; a successful recovery runs a
-    // cursor-based catch-up and processes the same message with its original
-    // Telegram publication time.
-    if (!verifiedRecovery && (this.disconnectedChecks > 0 || this.reconnecting)) {
+    // The gate may have closed while this item was already waiting on the FIFO
+    // processing chain. Preserve it for the atomic recovery merge instead of
+    // consuming its dedupe key or silently losing it.
+    if (this.recoveryPending || this.reconnecting) {
+      this.bufferRecoveryMessage(raw, receivedAt, authorizationToken)
       return
     }
 
@@ -518,6 +646,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       channelId: channel?.id?.toString(),
       channelTitle: channel?.title,
       receivedAt,
+      recovered,
     })
     if (!signal) {
       await this.notifyIgnored({
@@ -528,25 +657,48 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       return
     }
 
-    this.dispatchMessage(signal)
+    this.dispatchMessage(signal, { authorizationToken })
   }
 
   private async catchUpMessages(fromMessageId = this.lastSeenMessageId): Promise<void> {
+    const messages = await this.collectCatchUpMessages(fromMessageId)
+    await Promise.all(
+      messages.map((message) =>
+        this.enqueueRawMessage(
+          message.raw,
+          message.receivedAt,
+          message.recovered,
+          message.authorizationToken,
+        ),
+      ),
+    )
+  }
+
+  private async collectCatchUpMessages(
+    fromMessageId = this.lastSeenMessageId,
+  ): Promise<QueuedTelegramMessage[]> {
     const client = this.client
     const channel = this.channelEntity
-    if (!client || !channel || !client.connected) {
-      return
-    }
+    if (!client) throw new Error('Telegram client is unavailable during catch-up')
+    if (!channel) throw new Error('Telegram channel is unavailable during catch-up')
+    if (!client.connected) throw new Error('Telegram disconnected before catch-up')
 
     const batchSize = this.options.catchUpLimit ?? 100
     let cursor = fromMessageId
+    const collected = new Map<number, QueuedTelegramMessage>()
     while (!this.stopRequested) {
+      if (this.client !== client || this.channelEntity !== channel || !client.connected) {
+        throw new Error('Telegram connection changed during catch-up')
+      }
       const messages = await client.getMessages(channel, {
         limit: batchSize,
         minId: cursor,
         reverse: true,
       })
-      if (messages.length === 0) return
+      if (this.client !== client || this.channelEntity !== channel || !client.connected) {
+        throw new Error('Telegram disconnected during catch-up')
+      }
+      if (messages.length === 0) break
 
       // All posts in this response entered the local process together. Their
       // Telegram publication timestamps remain in each raw message and let the
@@ -554,12 +706,22 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       const receivedAt = new Date()
       let nextCursor = cursor
       for (const message of messages) {
+        if (!Number.isSafeInteger(message.id) || message.id <= 0) {
+          throw new Error('Telegram catch-up returned an invalid message id')
+        }
         nextCursor = Math.max(nextCursor, message.id)
-        await this.enqueueRawMessage(message, receivedAt, true)
+        if (message.id > fromMessageId && !collected.has(message.id)) {
+          collected.set(message.id, { raw: message, receivedAt, recovered: true })
+        }
       }
-      if (messages.length < batchSize || nextCursor <= cursor) return
+      if (messages.length < batchSize) break
+      if (nextCursor <= cursor) {
+        throw new Error('Telegram catch-up cursor did not advance')
+      }
       cursor = nextCursor
     }
+    if (this.stopRequested) throw new Error('Telegram catch-up cancelled')
+    return [...collected.values()].sort((left, right) => left.raw.id - right.raw.id)
   }
 
   private startHealthTimer(): void {
@@ -578,63 +740,240 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     }
   }
 
-  private async healthCheck(): Promise<void> {
+  private scheduleRecoveryConfirmation(): void {
+    if (this.recoveryConfirmationTimer || this.stopRequested) return
+    const interval = this.options.healthCheckIntervalMs ?? 5_000
+    this.recoveryConfirmationTimer = setTimeout(() => {
+      this.recoveryConfirmationTimer = undefined
+      if (this.stopRequested || !this.recoveryPending) return
+      this.disconnectedChecks = DISCONNECT_CONFIRMATION_CHECKS
+      this.publishConfirmedReconnect('Telegram recovery exceeded one health interval')
+    }, interval)
+    this.recoveryConfirmationTimer.unref?.()
+  }
+
+  private clearRecoveryConfirmationTimer(): void {
+    if (!this.recoveryConfirmationTimer) return
+    clearTimeout(this.recoveryConfirmationTimer)
+    this.recoveryConfirmationTimer = undefined
+  }
+
+  private healthCheck(): Promise<void> {
+    if (this.healthCheckPromise) return this.healthCheckPromise
+
+    const operation = this.healthCheckInternal()
+    let tracked: Promise<void>
+    tracked = operation.finally(() => {
+      if (this.healthCheckPromise === tracked) this.healthCheckPromise = undefined
+    })
+    this.healthCheckPromise = tracked
+    return tracked
+  }
+
+  private async healthCheckInternal(): Promise<void> {
     const client = this.client
-    if (this.stopRequested || !client || this.reconnecting) {
-      return
-    }
+    if (this.stopRequested || !client) return
+    if (this.recoveryPromise) return
 
-    if (client.connected) {
-      const needsCatchUp = this.disconnectedChecks > 0 || this.stateValue === 'reconnecting'
-      const reconnectWasPublished = this.stateValue === 'reconnecting'
-      this.disconnectedChecks = 0
-      if (needsCatchUp) {
-        try {
-          await this.catchUpMessages(this.recoveryFromMessageId ?? this.lastSeenMessageId)
-          this.recoveryFromMessageId = undefined
-        } catch (error) {
-          await this.reportError(error, true)
-          return
-        }
-        if (reconnectWasPublished) {
-          this.setState('connected', `Reconnected to @${this.channelUsername}`)
-        }
+    if (!client.connected) {
+      this.recordFailedConnectionSample()
+      if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
+        this.publishConfirmedReconnect()
+        await this.beginRecovery().catch(() => undefined)
       }
-      await this.persistSession().catch((error) => this.reportError(error, true))
       return
     }
 
-    this.disconnectedChecks += 1
-    if (this.disconnectedChecks === 1) {
-      // Freeze the recovery cursor at the first observed outage. Events may
-      // still be delivered out of GramJS' update queue while reconnecting.
-      this.recoveryFromMessageId = this.lastSeenMessageId
-    }
-    // One false sample can be a brief Clash/GramJS flag transition. Give the
-    // transport one complete health interval to recover before publishing a
-    // real connection change to the safety controller.
-    if (this.disconnectedChecks < DISCONNECT_CONFIRMATION_CHECKS) {
+    if (this.recoveryPending) {
+      await this.beginRecovery().catch(() => undefined)
       return
     }
 
-    this.setState('reconnecting', 'Telegram connection lost on consecutive health checks')
-
-    this.reconnecting = true
+    const probeRevision = this.recoveryRevision
+    let authorized = false
     try {
-      await client.connect()
-      if (!(await client.checkAuthorization())) {
-        throw new Error('Telegram session is no longer authorized')
-      }
-      await this.catchUpMessages(this.recoveryFromMessageId ?? this.lastSeenMessageId)
-      await this.persistSession()
-      this.recoveryFromMessageId = undefined
-      this.disconnectedChecks = 0
-      this.setState('connected', `Reconnected to @${this.channelUsername}`)
+      authorized = await client.checkAuthorization()
     } catch (error) {
       await this.reportError(error, true)
-    } finally {
-      this.reconnecting = false
     }
+    if (
+      this.stopRequested ||
+      this.client !== client ||
+      this.recoveryRevision !== probeRevision ||
+      this.recoveryPending
+    ) {
+      return
+    }
+    if (!authorized) {
+      this.recordFailedConnectionSample()
+      if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
+        this.publishConfirmedReconnect('Telegram authorization probe failed twice')
+        await this.beginRecovery().catch(() => undefined)
+      }
+      return
+    }
+
+    await this.persistSession().catch((error) => this.reportError(error, true))
+  }
+
+  private installConnectionStateHandler(client: TelegramClient): void {
+    this.connectionEventBuilder = new Raw({ types: [UpdateConnectionState] })
+    this.connectionEventHandler = (event: unknown) => {
+      if (!(event instanceof UpdateConnectionState) || this.stopRequested) return
+
+      if (event.state === UpdateConnectionState.broken || event.state === UpdateConnectionState.disconnected) {
+        this.markRecoveryPending()
+        return
+      }
+      if (
+        event.state === UpdateConnectionState.connected &&
+        this.recoveryPending &&
+        (this.stateValue === 'connected' || this.stateValue === 'reconnecting')
+      ) {
+        void this.beginRecovery().catch(() => undefined)
+      }
+    }
+    client.addEventHandler(this.connectionEventHandler, this.connectionEventBuilder)
+  }
+
+  private markRecoveryPending(): void {
+    this.recoveryRevision += 1
+    if (this.recoveryPending) return
+
+    this.recoveryPending = true
+    this.recoveryFromMessageId = this.lastSeenMessageId
+    this.recoveryMessageBuffer = []
+    this.recoveryBufferOverflow = false
+    this.disconnectedChecks = Math.max(1, this.disconnectedChecks)
+    this.scheduleRecoveryConfirmation()
+  }
+
+  private recordFailedConnectionSample(): void {
+    if (!this.recoveryPending) {
+      this.markRecoveryPending()
+      return
+    }
+    this.recoveryRevision += 1
+    this.disconnectedChecks = Math.min(
+      DISCONNECT_CONFIRMATION_CHECKS,
+      Math.max(1, this.disconnectedChecks) + 1,
+    )
+  }
+
+  private publishConfirmedReconnect(
+    detail = 'Telegram connection lost on consecutive health checks',
+  ): void {
+    this.reconnecting = true
+    this.clearRecoveryConfirmationTimer()
+    if (this.stateValue !== 'reconnecting') this.setState('reconnecting', detail)
+  }
+
+  private beginRecovery(): Promise<void> {
+    if (this.recoveryPromise) return this.recoveryPromise
+
+    const operation = this.recoverConnection().catch(async (error) => {
+      if (!this.stopRequested) {
+        this.disconnectedChecks = Math.min(
+          DISCONNECT_CONFIRMATION_CHECKS,
+          Math.max(1, this.disconnectedChecks) + 1,
+        )
+        if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
+          this.publishConfirmedReconnect('Telegram recovery could not be verified')
+        }
+        await this.reportError(error, true)
+      }
+      throw error
+    })
+    let tracked: Promise<void>
+    tracked = operation.finally(() => {
+      if (this.recoveryPromise === tracked) this.recoveryPromise = undefined
+    })
+    this.recoveryPromise = tracked
+    return tracked
+  }
+
+  private async recoverConnection(): Promise<void> {
+    const client = this.client
+    if (!client) throw new Error('Telegram client is unavailable during recovery')
+    if (!this.channelEntity) throw new Error('Telegram channel is unavailable during recovery')
+    if (!this.recoveryPending) return
+
+    // An overflowed residual buffer is not authoritative: the frozen channel
+    // cursor is. Discard it before a retry and rebuild the range from Telegram,
+    // while the live handler captures a fresh residual buffer for this attempt.
+    if (this.recoveryBufferOverflow) {
+      this.recoveryMessageBuffer = []
+      this.recoveryBufferOverflow = false
+    }
+    const recoveryCursor = this.recoveryFromMessageId ?? this.lastSeenMessageId
+    if (!client.connected) await client.connect()
+    if (this.stopRequested) throw new Error('Telegram recovery cancelled')
+    if (!client.connected || !(await client.checkAuthorization())) {
+      throw new Error('Telegram session is not connected and authorized')
+    }
+
+    // connect() may rotate through several DC addresses and emit a transient
+    // disconnected update before a later internal attempt succeeds. Snapshot
+    // only after that whole connection/authentication phase; from this point
+    // onward, a new negative update invalidates the catch-up window.
+    const recoveryRevision = this.recoveryRevision
+    const caughtUpMessages = await this.collectCatchUpMessages(recoveryCursor)
+    const authorizationStillValid = client.connected && (await client.checkAuthorization())
+    if (
+      this.stopRequested ||
+      this.client !== client ||
+      recoveryRevision !== this.recoveryRevision ||
+      !client.connected ||
+      !authorizationStillValid
+    ) {
+      throw new Error('Telegram connection changed while recovery was being verified')
+    }
+    if (this.recoveryBufferOverflow) {
+      throw new Error('Telegram recovery buffer exceeded its safety limit')
+    }
+
+    // No await is allowed between taking the residual-buffer snapshot and
+    // opening the gate. JavaScript's run-to-completion semantics make this an
+    // atomic hand-off with the live NewMessage handler.
+    const recoveredMessages = mergeQueuedMessages(caughtUpMessages, this.recoveryMessageBuffer)
+    this.recoveryMessageBuffer = []
+    this.recoveryBufferOverflow = false
+    this.recoveryPending = false
+    this.clearRecoveryConfirmationTimer()
+    this.recoveryFromMessageId = undefined
+    this.disconnectedChecks = 0
+    const reconnectWasPublished = this.stateValue === 'reconnecting'
+    this.reconnecting = false
+    // Append the entire recovered range to the FIFO in one synchronous turn.
+    // A live NewMessage callback cannot interleave a newer id between two
+    // recovered ids before all of them have reserved their queue positions.
+    const recoveryDispatches = recoveredMessages.map((message) =>
+      this.enqueueRawMessage(
+        message.raw,
+        message.receivedAt,
+        message.recovered,
+        message.authorizationToken,
+      ),
+    )
+    if (reconnectWasPublished) {
+      this.setState('connected', `Reconnected to @${this.channelUsername}`)
+    }
+
+    await Promise.all(recoveryDispatches)
+    await this.persistSession().catch((error) => this.reportError(error, true))
+  }
+
+  private bufferRecoveryMessage(
+    raw: Api.Message,
+    receivedAt: Date,
+    authorizationToken?: SignalTradeAuthorizationToken,
+  ): void {
+    if (this.stopRequested || this.recoveryBufferOverflow) return
+    if (this.recoveryMessageBuffer.length >= MAX_RECOVERY_BUFFER_MESSAGES) {
+      this.recoveryBufferOverflow = true
+      return
+    }
+    this.recoveryMessageBuffer.push({ raw, receivedAt, recovered: true, authorizationToken })
   }
 
   private async persistSession(): Promise<void> {
@@ -693,13 +1032,16 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     await this.invokeCallback(this.options.callbacks?.onIgnoredMessage, event)
   }
 
-  private dispatchMessage(message: TelegramSignalMessage): void {
+  private dispatchMessage(
+    message: TelegramSignalMessage,
+    context: TelegramMessageDispatchContext,
+  ): void {
     // setImmediate deliberately leaves the transport Promise chain first. This
     // keeps a slow AI/network callback from delaying validation and dispatch of
     // later Telegram updates while retaining FIFO callback start order.
     const task = new Promise<void>((resolve) => {
       setImmediate(() => {
-        void this.deliverMessage(message)
+        void this.deliverMessage(message, context)
           .catch((error) => this.reportError(error, true))
           .finally(resolve)
       })
@@ -710,10 +1052,17 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     })
   }
 
-  private async deliverMessage(message: TelegramSignalMessage): Promise<void> {
+  private async deliverMessage(
+    message: TelegramSignalMessage,
+    context: TelegramMessageDispatchContext,
+  ): Promise<void> {
     if (this.stopRequested) return
     this.emitSafely('message', message)
-    await this.invokeCallback(this.options.callbacks?.onMessage, message)
+    try {
+      await this.options.callbacks?.onMessage?.(message, context)
+    } catch (error) {
+      await this.reportError(error, true)
+    }
   }
 
   private async awaitMessageDispatches(): Promise<void> {
@@ -766,6 +1115,36 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       await this.reportError(error, true)
     }
   }
+}
+
+function mergeQueuedMessages(
+  ...groups: QueuedTelegramMessage[][]
+): QueuedTelegramMessage[] {
+  const validMessages = new Map<number, QueuedTelegramMessage>()
+  const invalidMessages: QueuedTelegramMessage[] = []
+  for (const message of groups.flat()) {
+    const id = message.raw.id
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      invalidMessages.push(message)
+      continue
+    }
+    const existing = validMessages.get(id)
+    if (!existing) {
+      validMessages.set(id, message)
+      continue
+    }
+    const earliest = message.receivedAt.getTime() < existing.receivedAt.getTime()
+      ? message
+      : existing
+    validMessages.set(id, {
+      ...earliest,
+      recovered: existing.recovered || message.recovered,
+    })
+  }
+  return [
+    ...[...validMessages.values()].sort((left, right) => left.raw.id - right.raw.id),
+    ...invalidMessages,
+  ]
 }
 
 class AuthPromptBroker {
@@ -824,20 +1203,34 @@ interface HttpProxyShape {
   password?: string
 }
 
-/** Minimal GramJS network-socket adapter for a local HTTP CONNECT proxy. */
-class HttpConnectSocket {
+/** Minimal teleproto network-socket adapter for a local HTTP CONNECT proxy. */
+class HttpConnectSocket implements SocketInterface {
   private socket?: Socket
   private buffer = Buffer.alloc(0)
   private waiter?: { resolve: () => void; reject: (error: Error) => void }
   private terminalError?: Error
   private closed = true
+  private readonly proxy?: HttpProxyShape
 
-  constructor(private readonly proxy?: HttpProxyShape) {}
+  constructor(proxy?: unknown, private readonly keepAliveInterval = 30_000) {
+    if (isHttpProxyShape(proxy)) this.proxy = proxy
+  }
 
-  async connect(port: number, ip: string): Promise<this> {
+  async connect(port: number, ip: string, _testServers?: boolean): Promise<this> {
     if (!this.proxy?.ip || !this.proxy.port) {
       throw new Error('HTTP proxy host and port are required')
     }
+
+    const previousSocket = this.socket
+    if (previousSocket) {
+      previousSocket.removeAllListeners()
+      previousSocket.destroy()
+    }
+    this.socket = undefined
+    this.wakeWaiter(new Error('HTTP proxy socket is reconnecting'))
+    this.buffer = Buffer.alloc(0)
+    this.terminalError = undefined
+    this.closed = true
 
     this.socket = net.createConnection({ host: this.proxy.ip, port: this.proxy.port })
     this.closed = false
@@ -865,6 +1258,10 @@ class HttpConnectSocket {
       }
       const onTimeout = (): void => fail(new Error('HTTP proxy CONNECT timed out'))
       const sendConnect = (): void => {
+        socket.setNoDelay(true)
+        if (this.keepAliveInterval > 0) {
+          socket.setKeepAlive(true, this.keepAliveInterval)
+        }
         const authority = formatAuthority(ip, port)
         const auth = this.proxy?.username
           ? `Proxy-Authorization: Basic ${Buffer.from(`${this.proxy.username}:${this.proxy.password ?? ''}`).toString('base64')}\r\n`
@@ -936,8 +1333,10 @@ class HttpConnectSocket {
   async close(): Promise<void> {
     this.closed = true
     this.terminalError = new Error('HTTP proxy socket is closed')
-    this.socket?.destroy()
-    this.socket?.unref()
+    const socket = this.socket
+    this.socket = undefined
+    socket?.destroy()
+    socket?.unref()
     this.wakeWaiter(this.terminalError)
   }
 
@@ -948,10 +1347,12 @@ class HttpConnectSocket {
   private installSocketListeners(socket: Socket): void {
     socket.on('data', (chunk) => this.pushData(chunk))
     socket.on('error', (error) => {
+      if (this.socket !== socket) return
       this.terminalError = error
       this.wakeWaiter(error)
     })
     socket.on('close', () => {
+      if (this.socket !== socket) return
       this.closed = true
       this.terminalError ??= new Error('HTTP proxy socket closed')
       this.wakeWaiter(this.terminalError)
@@ -987,6 +1388,27 @@ class HttpConnectSocket {
   }
 }
 
+function isHttpProxyShape(value: unknown): value is HttpProxyShape {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<HttpProxyShape>
+  return typeof candidate.ip === 'string' && Number.isSafeInteger(candidate.port)
+}
+
+async function settleWithin(operation: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      operation.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 function validateOptions(options: TelegramMonitorOptions): void {
   if (!Number.isSafeInteger(options.apiId) || options.apiId <= 0) {
     throw new TypeError('Telegram apiId must be a positive integer')
@@ -1018,6 +1440,12 @@ function validateOptions(options: TelegramMonitorOptions): void {
     (!Number.isSafeInteger(options.healthCheckIntervalMs) || options.healthCheckIntervalMs < 1_000)
   ) {
     throw new TypeError('Telegram healthCheckIntervalMs must be at least 1000')
+  }
+  if (
+    options.stopDrainTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.stopDrainTimeoutMs) || options.stopDrainTimeoutMs <= 0)
+  ) {
+    throw new TypeError('Telegram stopDrainTimeoutMs must be a positive integer')
   }
 }
 

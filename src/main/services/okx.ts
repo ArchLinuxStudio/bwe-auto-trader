@@ -355,6 +355,8 @@ export interface PreparedOkxMarketOrder extends OkxOrderPreview {
 export interface SubmitPreparedOkxMarketOrderInput {
   intent: PreparedOkxMarketOrder
   arm: LiveTradeArm
+  /** Synchronous application-level authorization check, run up to the POST boundary. */
+  transmissionGuard?: () => void
 }
 
 export interface OkxCloseResult {
@@ -2220,6 +2222,7 @@ export class OkxV5Client {
   async submitPreparedMarketOrder(
     input: SubmitPreparedOkxMarketOrderInput
   ): Promise<OkxPlacedOrder> {
+    this.assertExternalTransmissionGuard(input.transmissionGuard)
     this.consumeLiveTradeArm(input.arm, 'open')
     const record = this.orderIntents.get(input.intent.intentToken)
     this.orderIntents.delete(input.intent.intentToken)
@@ -2237,7 +2240,8 @@ export class OkxV5Client {
       this.submitMarketOrderPreview(
         record.preview,
         generation,
-        record.expiresAt
+        record.expiresAt,
+        input.transmissionGuard
       )
     )
   }
@@ -2245,8 +2249,10 @@ export class OkxV5Client {
   private async submitMarketOrderPreview(
     preview: OkxOrderPreview,
     armGeneration: number,
-    expiresAt: number
+    expiresAt: number,
+    transmissionGuard?: () => void
   ): Promise<OkxPlacedOrder> {
+    this.assertExternalTransmissionGuard(transmissionGuard)
     this.requireVerifiedAccountForOpening()
     if (this.unknownOrderRecord) {
       throw new OkxConfigurationError(
@@ -2258,6 +2264,7 @@ export class OkxV5Client {
       this.getPendingOrders(),
       this.getPendingAlgoOrders()
     ])
+    this.assertExternalTransmissionGuard(transmissionGuard)
     const positions = positionsResponse.filter(isNonZeroPosition)
     if (positions.length > 0) {
       throw new OkxConfigurationError(
@@ -2275,7 +2282,13 @@ export class OkxV5Client {
       )
     }
     this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
-    await this.setOneXLeverage(preview.instId, armGeneration, expiresAt)
+    await this.setOneXLeverage(
+      preview.instId,
+      armGeneration,
+      expiresAt,
+      transmissionGuard
+    )
+    this.assertExternalTransmissionGuard(transmissionGuard)
     this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
     const clOrdId = this.createClientOrderId()
     const order = await this.submitIdentifiedOrder(
@@ -2292,7 +2305,8 @@ export class OkxV5Client {
         clOrdId
       },
       armGeneration,
-      expiresAt
+      expiresAt,
+      transmissionGuard
     )
     return {
       ...preview,
@@ -2454,6 +2468,18 @@ export class OkxV5Client {
     }
   }
 
+  private assertExternalTransmissionGuard(guard: (() => void) | undefined): void {
+    if (!guard) return
+    try {
+      guard()
+    } catch (error) {
+      if (error instanceof OkxLiveTradingNotArmedError) throw error
+      throw new OkxLiveTradingNotArmedError(
+        'Application live-trading authorization changed before transmission'
+      )
+    }
+  }
+
   private assertLiveGeneration(expectedGeneration: number): void {
     if (!this.liveArmed || this.liveArmGeneration !== expectedGeneration) {
       throw new OkxLiveTradingNotArmedError(
@@ -2542,7 +2568,8 @@ export class OkxV5Client {
   private async setOneXLeverage(
     instId: string,
     armGeneration: number,
-    expiresAt: number
+    expiresAt: number,
+    transmissionGuard?: () => void
   ): Promise<void> {
     await this.privateRequest<unknown>(
       'POST',
@@ -2550,7 +2577,10 @@ export class OkxV5Client {
       undefined,
       { instId, lever: '1', mgnMode: 'isolated' },
       undefined,
-      () => this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
+      () => {
+        this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
+        this.assertExternalTransmissionGuard(transmissionGuard)
+      }
     )
   }
 
@@ -2560,11 +2590,13 @@ export class OkxV5Client {
     operation: OkxTradeArmScope,
     body: Record<string, unknown>,
     armGeneration: number,
-    expiresAt: number
+    expiresAt: number,
+    transmissionGuard?: () => void
   ): Promise<OkxOrderResponseItem> {
     // Keep time sync outside the ambiguous-result boundary: if this read-only
     // prerequisite fails, the order endpoint was never called.
     await this.ensureServerTimeSynchronized()
+    this.assertExternalTransmissionGuard(transmissionGuard)
     try {
       const response = await this.request<OkxOrderResponseItem>(
         'POST',
@@ -2573,7 +2605,10 @@ export class OkxV5Client {
         body,
         true,
         expiresAt,
-        () => this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
+        () => {
+          this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
+          this.assertExternalTransmissionGuard(transmissionGuard)
+        }
       )
       return this.requireSuccessfulOrderResponse(response, clOrdId)
     } catch (error) {

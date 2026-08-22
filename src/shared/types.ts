@@ -31,6 +31,8 @@ export interface TelegramMessagePayload {
   date: number
   receivedAt: number
   permalink?: string
+  /** True for startup/reconnect replay; it may be analyzed but can never trade. */
+  recovered?: boolean
 }
 
 export interface AiAnalysis {

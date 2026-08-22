@@ -1,6 +1,6 @@
 {
   "name": "bwe-auto-trader",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Cross-platform BWEnews signal monitor and OKX trading desktop app",
   "main": "./out/main/index.js",
   "author": "ArchLinuxStudio",
@@ -17,12 +17,14 @@
   "type": "module",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "npm run typecheck && electron-vite build",
+    "check:dependencies": "node scripts/check-production-dependencies.mjs",
+    "check:built": "node scripts/check-built-output.mjs",
+    "build": "npm run check:dependencies && npm run typecheck && electron-vite build && npm run check:built",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "package:win": "npm run build && electron-builder --win nsis --x64",
+    "package:win": "npm run build && electron-builder --win nsis zip --x64",
     "package:mac": "npm run build && electron-builder --mac dmg --x64 --arm64",
     "package:linux": "npm run build && electron-builder --linux AppImage deb --x64",
     "package:linux:arm64": "npm run build && electron-builder --linux AppImage deb --arm64"
@@ -30,11 +32,12 @@
   "dependencies": {
     "@openai/codex": "0.147.0",
     "socks": "2.8.9",
-    "telegram": "2.26.22",
+    "teleproto": "1.228.5",
     "ws": "8.21.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@types/node": "24.10.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
@@ -54,28 +57,52 @@
     "appId": "com.local.bweautotrader",
     "productName": "BWE Auto Trader",
     "asar": true,
+    "afterPack": "./scripts/after-pack-license-check.cjs",
     "asarUnpack": [
       "node_modules/@openai/codex/**",
       "node_modules/@openai/codex-*/**"
     ],
     "directories": {
-      "output": "release"
+      "output": "release-v${version}"
     },
     "files": [
       "out/**/*",
-      "package.json",
-      "LICENSE"
+      "package.json"
+    ],
+    "extraFiles": [
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.txt",
+        "to": "THIRD_PARTY_NOTICES.txt"
+      },
+      {
+        "from": "licenses",
+        "to": "licenses",
+        "filter": [
+          "third-party-manifest.json",
+          "third-party/**/*"
+        ]
+      }
     ],
     "win": {
       "target": [
         {
           "target": "nsis",
           "arch": ["x64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["x64"]
         }
       ],
-      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}"
+      "artifactName": "${productName}-Portable-${version}-${arch}.${ext}"
     },
     "nsis": {
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}",
+      "license": "LICENSE",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,

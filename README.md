@@ -9,8 +9,8 @@
 
 ## 当前范围
 
-- Windows / macOS / Linux 源码与构建脚本（Electron + React + TypeScript）；`0.1.5` 仅在 Windows x64 完成安装包构建与本机验证，macOS/Linux 仍需对应系统或 CI 验证
-- Telegram 本人账号 MTProto 登录，仅处理程序连接后的新消息；按入队时刻记录延迟，重连补拉的旧消息不会触发下单
+- Windows / macOS / Linux 源码与构建脚本（Electron + React + TypeScript）；`0.1.6` 已在 Windows x64 完成 NSIS 安装包、便携 ZIP、afterPack、压缩完整性和隔离冷启动验证，macOS/Linux 仍需对应系统或 CI 验证
+- Telegram 本人账号通过固定版本的 `teleproto` 连接 MTProto；现有加密 GramJS StringSession 可直接迁移。程序会 AI 分析并展示启动/重连补拉消息，但这类消息永远不会触发下单
 - Telegram 与 ChatGPT 使用 Clash Party（默认 `127.0.0.1:7890`）
 - ChatGPT Plus 官方 Codex 登录，10 秒超时即 `SKIP`
 - OKX REST 与私有 WebSocket 分别直连优先；直连失败时为本次连接固定使用应用内 Clash。连接时校验 Read + Trade、独立子账户、net 模式，以及普通挂单和 8 类未触发策略委托
@@ -29,8 +29,10 @@
 
 ```powershell
 npm.cmd install
+npm.cmd run check:dependencies
 npm.cmd run typecheck
 npm.cmd test
+npm.cmd run build
 npm.cmd run dev
 ```
 
@@ -53,7 +55,7 @@ npm.cmd install
 4. 可选运行网络诊断查看当前出口。是否给 OKX API Key 绑定 IP 白名单由你决定，不影响程序连接或解锁实盘。
 5. 三个连接全绿后开启监听。观察分析结果无误，再输入“确认实盘”解锁真实下单。
 
-任何重启、已确认的连接中断、OKX 数据流异常或订单状态不明确，都会自动锁定实盘。Telegram 每 5 秒检查连接；单次瞬时采样失败只暂停残余队列并在恢复后按 cursor 补拉，不撤销实盘授权，连续两次失败才判定为真实重连并锁定。GramJS 的一般可恢复错误只作诊断，不能单独触发锁定。状态不明确的订单只会只读对账，永不自动重试。专用子账户持仓区会显示该子账户的全部 SWAP 持仓，不会把其他来源的仓位误称为本程序仓位。
+任何重启、已确认的连接中断、OKX 数据流异常或订单状态不明确，都会自动锁定实盘。Telegram 一出现疑似断线就会立即关闭内部交易门禁，禁止在校验/补拉期间解锁或发单；如果在一个健康检查周期内恢复，程序原有的实盘授权不会被误撤销。如果断线持续超过一个周期或再次收到失败状态，则确认进入重连、锁定实盘；恢复后必须人工重新输入确认词。每条实时消息还会绑定其到达时的授权与连接代次：到达时未解锁，或分析期间发生锁定、恢复、停止监听、重新解锁，该消息都只能展示 AI 结果。此门禁会一直复核到 OKX 真实订单 POST 前。补拉消息同样永远不能下单。teleproto 的一般可恢复错误只作诊断，不能单独触发锁定。状态不明确的订单只会只读对账，永不自动重试。专用子账户持仓区会显示该子账户的全部 SWAP 持仓，不会把其他来源的仓位误称为本程序仓位。
 
 更换为另一组 OKX API 凭据前，程序要求旧凭据仍连接，并重新只读确认旧账户没有 SWAP 仓位、普通未完成订单、8 类未触发策略委托或本地待确认订单。先断开旧账户不能绕过这项检查；保存、连接、断开、解锁和平仓也由主进程串行互斥，避免在切换账户期间发出交易请求。
 
@@ -77,7 +79,7 @@ npm.cmd run package:mac
 npm.cmd run package:linux
 ```
 
-macOS 和 Linux 安装包应分别在对应系统或 CI runner 上生成。正式对外分发前需配置 Windows 代码签名与 macOS Developer ID 签名/公证。
+macOS 和 Linux 安装包应分别在对应系统或 CI runner 上生成。当前 `0.1.6` Windows 安装包和主程序未配置发布者代码签名，Windows SmartScreen 可能警告；长期正式分发建议配置 Windows 代码签名，macOS 则需 Developer ID 签名与公证。
 
 ## 测试安全说明
 
@@ -99,4 +101,6 @@ macOS 和 Linux 安装包应分别在对应系统或 CI runner 上生成。正�
 - 不允许修改本软件或基于它制作衍生作品。
 - 商业使用、修改或分发需要事先取得 ArchLinuxStudio 的单独书面授权。
 
-第三方依赖继续适用其各自的许可证；本项目许可证不会覆盖或替代第三方条款。
+以上限制仅覆盖 ArchLinuxStudio 的原创代码。第三方依赖和运行时继续适用其各自的许可证；本项目许可证不会覆盖、替代或缩减第三方在 MIT、ISC、Apache-2.0、BSD、LGPL 等许可证下已经授予的权利。完整 npm 生产依赖清单、许可证证据和 OpenAI Codex NOTICE 见 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) 与 `licenses/third-party-manifest.json`。
+
+构建会检查 npm 生产依赖许可证、禁止旧 `telegram` / `@cryptography/aes` 链路，并在打包后再次扫描 ASAR。Windows 包还必须保留 Electron 的 `LICENSE.electron.txt` 和 Chromium 的 `LICENSES.chromium.html`；后者包含 FFmpeg 等 LGPL-2.1-or-later 组件。因此可以表述为“已移除旧 GramJS GPL 依赖”，不能把完整 Electron 安装包表述成“不含任何 GPL-family 或弱 copyleft 组件”。该工程检查和随包清单仍不等同于法律意见。

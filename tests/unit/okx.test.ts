@@ -1208,6 +1208,46 @@ describe('live trading interlock', () => {
     expect(submittedExpTime).toBe(String(now + 2_000))
   })
 
+  it('runs the application transmission guard at the final order POST boundary', async () => {
+    const { client, fetchImpl } = createTradingHarness()
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+    const intent = await client.prepareMarketOrder(
+      { symbolOrInstId: 'BTC', direction: 'LONG' },
+      2_000
+    )
+    let guardCalls = 0
+
+    await expect(client.submitPreparedMarketOrder({
+      intent,
+      arm: client.armNextLiveTrade('open'),
+      transmissionGuard: () => {
+        guardCalls += 1
+        // Initial submit, preview entry, account-query completion,
+        // leverage beforeFetch/after, and pre-order time sync all pass. The
+        // seventh call is request()'s last synchronous boundary before POST.
+        if (guardCalls >= 7) throw new Error('Telegram revision changed')
+      }
+    })).rejects.toBeInstanceOf(OkxLiveTradingNotArmedError)
+
+    expect(guardCalls).toBeGreaterThanOrEqual(7)
+    expect(
+      fetchImpl.mock.calls.some(
+        ([input, init]) =>
+          new URL(input).pathname === '/api/v5/account/set-leverage' &&
+          init?.method === 'POST'
+      )
+    ).toBe(true)
+    expect(
+      fetchImpl.mock.calls.some(
+        ([input, init]) =>
+          new URL(input).pathname === '/api/v5/trade/order' &&
+          init?.method === 'POST'
+      )
+    ).toBe(false)
+    expect(client.requiresOrderReconciliation).toBe(false)
+  })
+
   it('re-checks emergency disarm after a last-moment time sync and before fetch', async () => {
     let now = 1_754_960_400_000
     let timeRequests = 0

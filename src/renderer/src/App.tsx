@@ -63,7 +63,7 @@ const EMPTY_SETTINGS: PublicSettings = {
 }
 
 const EMPTY_SNAPSHOT: AppSnapshot = {
-  version: '0.1.5',
+  version: '0.1.6',
   connections: {
     telegram: EMPTY_STATUS,
     chatgpt: EMPTY_STATUS,

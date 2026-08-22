@@ -27,9 +27,30 @@ import type {
   OkxV5Client
 } from '../../src/main/services/okx'
 import { OkxOrderStateUnknownError, OkxTransportError } from '../../src/main/services/okx'
+import type { SignalTradeAuthorizationToken } from '../../src/main/services/signal-coordinator'
 import type { AppPosition, SignalRecord, TelegramMessagePayload } from '../../src/shared/types'
 
 const temporaryDirectories: string[] = []
+
+function installReadyTelegram(controller: AppController): void {
+  ;(controller as unknown as {
+    telegram?: {
+      readonly liveTradingReadiness: { ready: boolean; revision: number }
+      stop(): Promise<void>
+    }
+  }).telegram = {
+    liveTradingReadiness: { ready: true, revision: 0 },
+    stop: vi.fn(async () => undefined)
+  }
+}
+
+function captureSignalAuthorization(
+  controller: AppController
+): SignalTradeAuthorizationToken | undefined {
+  return (controller as unknown as {
+    currentSignalTradeAuthorization(): SignalTradeAuthorizationToken | undefined
+  }).currentSignalTradeAuthorization()
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -284,6 +305,39 @@ describe('AppController OKX route integration', () => {
     await test.controller.dispose()
   })
 
+  it('blocks arming during Telegram recovery and rechecks its revision after OKX awaits', async () => {
+    const test = await createCredentialLifecycleHarness()
+    test.internals.setConnection('telegram', 'connected', 'test')
+    test.internals.setConnection('chatgpt', 'connected', 'test')
+    await test.controller.startMonitoring()
+
+    let telegramReadiness = { ready: false, revision: 1 }
+    test.internals.telegram = {
+      get liveTradingReadiness() {
+        return { ...telegramReadiness }
+      },
+      stop: vi.fn(async () => undefined)
+    }
+    expect(test.controller.getSnapshot().safety.armBlockers).toContain('Telegram 正在校验断线补拉')
+    await expect(test.controller.armLiveTrading('确认实盘')).rejects.toThrow('Telegram 正在校验断线补拉')
+
+    telegramReadiness = { ready: true, revision: 1 }
+    let resolvePositions!: (positions: OkxPosition[]) => void
+    const positionsGate = new Promise<OkxPosition[]>((resolve) => {
+      resolvePositions = resolve
+    })
+    const callsBeforeArm = test.getPositions.mock.calls.length
+    test.getPositions.mockImplementationOnce(() => positionsGate)
+    const arming = test.controller.armLiveTrading('确认实盘')
+    await vi.waitFor(() => expect(test.getPositions.mock.calls.length).toBe(callsBeforeArm + 1))
+    telegramReadiness = { ready: true, revision: 2 }
+    resolvePositions([])
+
+    await expect(arming).rejects.toThrow('Telegram 正在恢复')
+    expect(test.setLiveTradingArmed.mock.calls.some(([armed]) => armed === true)).toBe(false)
+    await test.controller.dispose()
+  })
+
   it('keeps an in-flight opening POST unknown after OKX disconnect and client replacement', async () => {
     const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-inflight-unknown-'))
     temporaryDirectories.push(userDataDirectory)
@@ -379,7 +433,10 @@ describe('AppController OKX route integration', () => {
         detail?: string
       ): void
       coordinator: {
-        process(message: TelegramMessagePayload): Promise<SignalRecord | undefined>
+        process(
+          message: TelegramMessagePayload,
+          authorizationToken?: SignalTradeAuthorizationToken
+        ): Promise<SignalRecord | undefined>
         hasPendingOrder: boolean
       }
       scheduleUnknownOrderReconciliation(
@@ -392,6 +449,7 @@ describe('AppController OKX route integration', () => {
       }
     }
     const scheduleReconciliation = vi.spyOn(internals, 'scheduleUnknownOrderReconciliation')
+    installReadyTelegram(controller)
     internals.setConnection('telegram', 'connected', 'test')
     internals.setConnection('chatgpt', 'connected', 'test')
     await controller.startMonitoring()
@@ -405,7 +463,7 @@ describe('AppController OKX route integration', () => {
       date: now,
       receivedAt: now,
       permalink: 'https://t.me/BWEnews/9101'
-    })
+    }, captureSignalAuthorization(controller))
     await vi.waitFor(() => expect(oldSubmitPreparedMarketOrder).toHaveBeenCalledOnce())
 
     await controller.disconnectOkx()
@@ -683,7 +741,10 @@ describe('AppController OKX route integration', () => {
         detail?: string
       ): void
       coordinator: {
-        process(message: TelegramMessagePayload): Promise<SignalRecord | undefined>
+        process(
+          message: TelegramMessagePayload,
+          authorizationToken?: SignalTradeAuthorizationToken
+        ): Promise<SignalRecord | undefined>
       }
       handleTelegramStatus(status: {
         state: 'connected' | 'reconnecting'
@@ -709,6 +770,7 @@ describe('AppController OKX route integration', () => {
         lastError: string | null
       }): void
     }
+    installReadyTelegram(controller)
     internals.setConnection('telegram', 'connected', 'test')
     internals.setConnection('chatgpt', 'connected', 'test')
     await controller.startMonitoring()
@@ -781,7 +843,10 @@ describe('AppController OKX route integration', () => {
       receivedAt: now,
       permalink: 'https://t.me/BWEnews/9001'
     }
-    await expect(internals.coordinator.process(payload)).resolves.toMatchObject({
+    await expect(internals.coordinator.process(
+      payload,
+      captureSignalAuthorization(controller)
+    )).resolves.toMatchObject({
       stage: 'submitted',
       clientOrderId: 'bwe-loop-1'
     })
@@ -926,7 +991,10 @@ describe('AppController OKX route integration', () => {
         detail?: string
       ): void
       coordinator: {
-        process(message: TelegramMessagePayload): Promise<SignalRecord | undefined>
+        process(
+          message: TelegramMessagePayload,
+          authorizationToken?: SignalTradeAuthorizationToken
+        ): Promise<SignalRecord | undefined>
       }
     }
     internals.setConnection('telegram', 'connected', 'test')
@@ -956,7 +1024,10 @@ describe('AppController OKX route integration', () => {
       receivedAt: 1_700_000_000_000,
       permalink: 'https://t.me/BWEnews/9201'
     }
-    await expect(internals.coordinator.process(payload)).resolves.toBeUndefined()
+    await expect(internals.coordinator.process(
+      payload,
+      captureSignalAuthorization(test.controller)
+    )).resolves.toBeUndefined()
     expect(analyzeSignal).not.toHaveBeenCalled()
     expect(test.prepareMarketOrder).not.toHaveBeenCalled()
     expect(test.submitPreparedMarketOrder).not.toHaveBeenCalled()
@@ -1009,7 +1080,10 @@ describe('AppController OKX route integration', () => {
         detail?: string
       ): void
       coordinator: {
-        process(message: TelegramMessagePayload): Promise<SignalRecord | undefined>
+        process(
+          message: TelegramMessagePayload,
+          authorizationToken?: SignalTradeAuthorizationToken
+        ): Promise<SignalRecord | undefined>
       }
     }
     internals.setConnection('telegram', 'connected', 'test')
@@ -1025,7 +1099,7 @@ describe('AppController OKX route integration', () => {
       date: 1_700_000_000_000,
       receivedAt: 1_700_000_000_000,
       permalink: 'https://t.me/BWEnews/9202'
-    })
+    }, captureSignalAuthorization(test.controller))
     await vi.waitFor(() => expect(test.prepareMarketOrder).toHaveBeenCalledOnce())
 
     // Make the close target visible only after the signal has crossed its
@@ -1265,6 +1339,7 @@ async function createPositionCloseHarness(options: {
     ...(options.analyzeSignal ? { analyzeSignal: options.analyzeSignal } : {})
   })
   await controller.initialize()
+  installReadyTelegram(controller)
   await controller.saveOkxCredentials({
     apiKey: 'api-key-close-sensitive',
     secretKey: 'secret-close-sensitive',
@@ -1344,6 +1419,7 @@ async function createCredentialLifecycleHarness(options: {
     createOkxClient: () => fakeClient
   })
   await controller.initialize()
+  installReadyTelegram(controller)
   const originalCredentials = {
     apiKey: 'api-key-lifecycle-original-sensitive',
     secretKey: 'secret-lifecycle-original-sensitive',
@@ -1363,6 +1439,10 @@ async function createCredentialLifecycleHarness(options: {
       detail?: string
     ): void
     secretStore: { get(key: string): Promise<string | undefined> }
+    telegram?: {
+      readonly liveTradingReadiness: { ready: boolean; revision: number }
+      stop(): Promise<void>
+    }
   }
 
   return {

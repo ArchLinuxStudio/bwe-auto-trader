@@ -1,0 +1,203 @@
+BWE AUTO TRADER - THIRD-PARTY NOTICES
+Version 0.1.6
+
+This distribution includes the third-party software listed below. Each
+component remains subject to its own license; the BWE Auto Trader LICENSE does
+not replace those third-party terms. Complete reviewed license texts and
+required upstream notices are shipped under licenses/third-party/.
+
+The BWE Auto Trader LICENSE applies only to ArchLinuxStudio's original work.
+It does not remove, narrow, or replace permissions granted by MIT, ISC,
+Apache-2.0, BSD, LGPL, or other third-party licenses.
+
+The inventory includes every production dependency reachable from
+package-lock.json. Platform-specific @openai/codex packages are listed for all
+supported targets; a built artifact contains only the entry for its target.
+
+store2 licensing choice
+-----------------------
+store2 2.14.4 declares MIT in its npm package metadata. Its distributed
+dist/store2.js is marked "Licensed MIT"; some included source files offer a
+choice between MIT and GPL. This distribution affirmatively elects and uses
+the MIT option. See licenses/third-party/store2-2.14.4-MIT.txt.
+
+OpenAI Codex upstream NOTICE
+----------------------------
+OpenAI Codex
+Copyright 2025 OpenAI
+
+This project includes code derived from Ratatui
+(https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers
+
+Electron and Chromium runtime
+-----------------------------
+The Windows application embeds Electron 43.4.0, Chromium 150.0.7871.224, and
+Node.js 24.18.1. Electron's license is installed as LICENSE.electron.txt.
+Chromium and its bundled components use many independent licenses, preserved
+in LICENSES.chromium.html. That inventory includes weak-copyleft components,
+including FFmpeg under LGPL-2.1-or-later. Consult that HTML file for the exact
+component-by-component terms, notices, and source locations.
+
+This runtime inventory is reviewed for the Windows x64 v0.1.6 artifact only.
+macOS and Linux public binaries require their own target-specific runtime audit.
+
+Runtime source and build provenance:
+
+  Electron: https://github.com/electron/electron/tree/v43.4.0
+  Electron release: https://github.com/electron/electron/releases/tag/v43.4.0
+  Electron build instructions:
+    https://github.com/electron/electron/blob/v43.4.0/docs/development/build-instructions-gn.md
+  Chromium source:
+    https://chromium.googlesource.com/chromium/src/+/150.0.7871.224
+
+The npm production dependency gate described below excludes the retired
+telegram and @cryptography/aes packages. That narrow result must not be
+described as making the complete Electron installer free of every GPL-family
+or weak-copyleft component.
+
+Production inventory
+--------------------
+
+Package-ID: @openai/codex@0.147.0
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: @openai/codex-darwin-arm64@0.147.0-darwin-arm64
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Target condition: platform=darwin; arch=arm64
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: @openai/codex-darwin-x64@0.147.0-darwin-x64
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Target condition: platform=darwin; arch=x64
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: @openai/codex-linux-arm64@0.147.0-linux-arm64
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Target condition: platform=linux; arch=arm64
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: @openai/codex-linux-x64@0.147.0-linux-x64
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Target condition: platform=linux; arch=x64
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: @openai/codex-win32-arm64@0.147.0-win32-arm64
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Target condition: platform=win32; arch=arm64
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: @openai/codex-win32-x64@0.147.0-win32-x64
+Installed name: @openai/codex
+Declared license: Apache-2.0
+Target condition: platform=win32; arch=x64
+Source: https://github.com/openai/codex
+License evidence: licenses/third-party/openai-codex-0.147.0-LICENSE.txt, licenses/third-party/openai-codex-0.147.0-NOTICE.txt
+
+Package-ID: big-integer@1.6.52
+Installed name: big-integer
+Declared license: Unlicense
+Source: https://github.com/peterolson/BigInteger.js
+License evidence: licenses/third-party/big-integer-1.6.52-Unlicense.txt
+
+Package-ID: graceful-fs@4.2.11
+Installed name: graceful-fs
+Declared license: ISC
+Source: https://github.com/isaacs/node-graceful-fs
+License evidence: licenses/third-party/graceful-fs-4.2.11-ISC.txt
+
+Package-ID: imurmurhash@0.1.4
+Installed name: imurmurhash
+Declared license: MIT
+Source: https://github.com/jensyt/imurmurhash-js
+License evidence: licenses/third-party/imurmurhash-0.1.4-MIT.txt
+
+Package-ID: ip-address@10.5.0
+Installed name: ip-address
+Declared license: MIT
+Source: https://github.com/beaugunderson/ip-address
+License evidence: licenses/third-party/ip-address-10.5.0-MIT.txt
+
+Package-ID: node-localstorage@2.2.1
+Installed name: node-localstorage
+Declared license: MIT
+Source: https://github.com/lmaccherone/node-localstorage
+License evidence: licenses/third-party/node-localstorage-2.2.1-MIT.txt
+
+Package-ID: slide@1.1.6
+Installed name: slide
+Declared license: ISC
+Source: https://github.com/isaacs/slide-flow-control
+License evidence: licenses/third-party/slide-1.1.6-ISC.txt
+
+Package-ID: smart-buffer@4.2.0
+Installed name: smart-buffer
+Declared license: MIT
+Source: https://github.com/JoshGlazebrook/smart-buffer
+License evidence: licenses/third-party/smart-buffer-4.2.0-MIT.txt
+
+Package-ID: socks@2.8.9
+Installed name: socks
+Declared license: MIT
+Source: https://github.com/JoshGlazebrook/socks
+License evidence: licenses/third-party/socks-2.8.9-MIT.txt
+
+Package-ID: store2@2.14.4
+Installed name: store2
+Declared license: MIT
+Source: https://github.com/nbubna/store
+License evidence: licenses/third-party/store2-2.14.4-MIT.txt
+
+Package-ID: teleproto@1.228.5
+Installed name: teleproto
+Declared license: MIT
+Source: https://github.com/sanyok12345/teleproto
+License evidence: licenses/third-party/teleproto-1.228.5-MIT.txt
+
+Package-ID: mime@3.0.0
+Installed name: mime
+Declared license: MIT
+Source: https://github.com/broofa/mime
+License evidence: licenses/third-party/mime-3.0.0-MIT.txt
+
+Package-ID: write-file-atomic@1.3.4
+Installed name: write-file-atomic
+Declared license: ISC
+Source: https://github.com/npm/write-file-atomic
+License evidence: licenses/third-party/write-file-atomic-1.3.4-ISC.txt
+
+Package-ID: ws@8.21.3
+Installed name: ws
+Declared license: MIT
+Source: https://github.com/websockets/ws
+License evidence: licenses/third-party/ws-8.21.3-MIT.txt
+
+Package-ID: zod@4.4.3
+Installed name: zod
+Declared license: MIT
+Source: https://github.com/colinhacks/zod
+License evidence: licenses/third-party/zod-4.4.3-MIT.txt
+
+Verification
+------------
+licenses/third-party-manifest.json is the machine-readable inventory. Build
+gates compare it with the package-lock production closure, the installed
+production tree, and the final packaged ASAR/unpacked dependency set. They also
+verify the SHA-256 digest of every evidence file and require this notice file
+and the evidence files to be present in the application package.
+
+This notice is an engineering compliance record, not legal advice.

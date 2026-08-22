@@ -55,7 +55,11 @@ import {
 } from './services/okx'
 import { SecretStore } from './services/secret-store'
 import { SettingsStore } from './services/settings-store'
-import { SignalCoordinator } from './services/signal-coordinator'
+import {
+  SignalCoordinator,
+  sameSignalTradeAuthorization,
+  type SignalTradeAuthorizationToken
+} from './services/signal-coordinator'
 import {
   TelegramMonitor,
   type TelegramAuthField,
@@ -161,6 +165,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private connections: AppSnapshot['connections']
   private monitoring = false
   private liveArmed = false
+  private liveArmRevision = 0
+  private monitoringRevision = 0
+  private telegramLifecycleRevision = 0
+  private liveArmCapability?: object
   private emergencyStopped = false
   private armedAt?: number
   private aiModel?: string
@@ -204,13 +212,17 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.coordinator = new SignalCoordinator({
       now: this.now,
       settings: () => this.settings.trading,
-      safety: () => ({
-        monitoring: this.monitoring,
-        liveArmed: this.liveArmed,
-        okxConnected: this.connections.okx.phase === 'connected',
-        emergencyStopped: this.emergencyStopped,
-        positionCloseInProgress: this.hasPositionCloseInterlock()
-      }),
+      safety: () => {
+        const authorizationToken = this.currentSignalTradeAuthorization()
+        return {
+          monitoring: this.monitoring,
+          liveArmed: Boolean(authorizationToken),
+          authorizationToken,
+          okxConnected: this.connections.okx.phase === 'connected',
+          emergencyStopped: this.emergencyStopped,
+          positionCloseInProgress: this.hasPositionCloseInterlock()
+        }
+      },
       analyze: async (message, timeoutMs) => {
         if (this.options.analyzeSignal) {
           return this.options.analyzeSignal(message, timeoutMs)
@@ -222,17 +234,18 @@ export class AppController extends EventEmitter<ControllerEvents> {
         await this.refreshPositions()
         return structuredClone(this.positions)
       },
-      openTrade: async ({ symbol, direction, targetNotionalUsdt, deadlineAt }) => {
+      openTrade: async ({
+        symbol,
+        direction,
+        targetNotionalUsdt,
+        deadlineAt,
+        authorizationToken
+      }) => {
         const client = this.requireOkx()
-        if (
-          !this.monitoring ||
-          this.emergencyStopped ||
-          !this.liveArmed ||
-          !client.isLiveTradingArmed ||
-          this.hasPositionCloseInterlock()
-        ) {
-          throw new Error('交易前安全状态已变化，实盘未解锁')
+        const transmissionGuard = (): void => {
+          this.assertSignalTradeAuthorization(authorizationToken, client)
         }
+        transmissionGuard()
         const remainingTtlMs = deadlineAt - this.now()
         if (remainingTtlMs <= 0) {
           throw new Error('交易前信号已超过 10 秒，已取消订单')
@@ -242,25 +255,19 @@ export class AppController extends EventEmitter<ControllerEvents> {
           direction,
           targetNotionalUsdt
         }, remainingTtlMs)
+        transmissionGuard()
         if (this.now() >= deadlineAt) {
           throw new Error('下单预检完成时信号已超过 10 秒，已取消订单')
-        }
-        if (
-          !this.monitoring ||
-          this.emergencyStopped ||
-          !this.liveArmed ||
-          !client.isLiveTradingArmed ||
-          this.okx !== client ||
-          this.connections.okx.phase !== 'connected' ||
-          this.hasPositionCloseInterlock()
-        ) {
-          throw new Error('下单预检完成时安全状态或 OKX 连接已变化，已取消订单')
         }
         // The one-time capability is minted only after all preview/network checks.
         const arm = client.armNextLiveTrade('open')
         let placed: OkxPlacedOrder
         try {
-          placed = await client.submitPreparedMarketOrder({ intent, arm })
+          placed = await client.submitPreparedMarketOrder({
+            intent,
+            arm,
+            transmissionGuard
+          })
         } catch (error) {
           if (error instanceof OkxOrderStateUnknownError) {
             this.unknownOrderOriginClients.set(error, client)
@@ -400,16 +407,21 @@ export class AppController extends EventEmitter<ControllerEvents> {
       secretStore: this.secretStore,
       proxy: this.settings.proxy,
       auth: { phoneNumber: stored.phoneNumber },
+      captureAuthorization: () => this.currentSignalTradeAuthorization(),
       callbacks: {
         onStatus: (status) => this.handleTelegramStatus(status),
         onAuthRequired: (request) => this.createTelegramPrompt(request),
-        onMessage: async (message) => {
-          await this.coordinator.process(toTelegramMessagePayload(message))
+        onMessage: async (message, context) => {
+          await this.coordinator.process(
+            toTelegramMessagePayload(message),
+            context.authorizationToken
+          )
         },
         onError: (event) => this.handleTelegramError(event)
       }
     })
     this.telegram = monitor
+    this.telegramLifecycleRevision += 1
     // start() reaches the auth broker before waiting for OTP/2FA, so wait a
     // short moment to surface immediate configuration/proxy failures while
     // still returning control to the renderer for interactive auth prompts.
@@ -428,7 +440,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.setConnection('telegram', 'connected', `已连接并守候 @${monitor.channelUsername}`)
       await this.audit.write('telegram_connected', 'info', { channel: monitor.channelUsername })
     } catch (error) {
-      if (this.telegram === monitor) this.telegram = undefined
+      if (this.telegram === monitor) {
+        this.telegram = undefined
+        this.telegramLifecycleRevision += 1
+      }
       await this.disarmLiveTrading('Telegram 连接失败，已锁定实盘').catch(() => undefined)
       this.setConnection('telegram', 'error', errorText(error))
       await this.notify('error', 'Telegram 连接失败', errorText(error))
@@ -439,11 +454,15 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.pendingPrompt = undefined
     const monitor = this.telegram
     this.telegram = undefined
+    if (monitor) this.telegramLifecycleRevision += 1
+    // stopMonitoring flips monitoring/liveArmed synchronously before its first
+    // await, so any already-running AI callback is fail-closed while the
+    // transport performs its bounded drain.
+    await this.stopMonitoring('Telegram 已断开').catch(() => undefined)
     if (monitor) {
       monitor.cancelAuthentication('用户断开 Telegram')
       await monitor.stop().catch(() => undefined)
     }
-    await this.stopMonitoring('Telegram 已断开')
     this.setConnection(
       'telegram',
       this.settings?.telegramConfigured ? 'disconnected' : 'not_configured',
@@ -762,6 +781,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     if (this.connectionBlockers().length) throw new Error(this.connectionBlockers().join('；'))
     const priorEmergencyStopped = this.emergencyStopped
     this.emergencyStopped = false
+    this.monitoringRevision += 1
     this.monitoring = true
     try {
       await this.audit.write('monitoring_started', 'info')
@@ -769,10 +789,9 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.emitSnapshot()
     } catch (error) {
       this.monitoring = false
+      this.monitoringRevision += 1
       this.emergencyStopped = priorEmergencyStopped
-      this.liveArmed = false
-      this.armedAt = undefined
-      this.okx?.setLiveTradingArmed(false)
+      this.invalidateOkxOpeningCapability()
       this.emitSnapshot()
       await this.audit.write('monitoring_start_rolled_back', 'warning', {
         error: errorText(error)
@@ -783,6 +802,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   async stopMonitoring(reason = '用户停止监听'): Promise<void> {
     const wasMonitoring = this.monitoring
+    this.monitoringRevision += 1
     this.monitoring = false
     await this.disarmLiveTrading()
     if (wasMonitoring) {
@@ -798,18 +818,33 @@ export class AppController extends EventEmitter<ControllerEvents> {
       throw new Error('平仓操作仍在提交或等待最终状态，不能解锁实盘')
     }
     const lifecycleRevision = this.okxLifecycleRevision
+    const telegramMonitor = this.telegram
+    const telegramRevision = telegramMonitor?.liveTradingReadiness.revision
+    const telegramLifecycleRevision = this.telegramLifecycleRevision
     return this.okxLifecycleMutex.runExclusive(
-      () => this.armLiveTradingUnlocked(confirmation, lifecycleRevision)
+      () => this.armLiveTradingUnlocked(
+        confirmation,
+        lifecycleRevision,
+        telegramMonitor,
+        telegramRevision,
+        telegramLifecycleRevision
+      )
     )
   }
 
   private async armLiveTradingUnlocked(
     confirmation: string,
-    lifecycleRevision: number
+    lifecycleRevision: number,
+    telegramMonitor: TelegramMonitor | undefined,
+    telegramRevision: number | undefined,
+    telegramLifecycleRevision: number
   ): Promise<void> {
     if (confirmation !== LIVE_ARM_CONFIRMATION) throw new Error(`请输入“${LIVE_ARM_CONFIRMATION}”以解锁实盘`)
     if (!this.monitoring) throw new Error('请先开启监听')
     if (this.liveArmed) throw new Error('实盘已经解锁，无需重复解锁')
+    if (!telegramMonitor || !telegramMonitor.liveTradingReadiness.ready) {
+      throw new Error('Telegram 正在校验断线补拉，暂时不能解锁实盘')
+    }
     const client = this.requireOkx()
     try {
       await this.refreshPositions(client)
@@ -823,11 +858,17 @@ export class AppController extends EventEmitter<ControllerEvents> {
     if (
       this.okxLifecycleRevision !== lifecycleRevision ||
       this.okx !== client ||
-      this.connections.okx.phase !== 'connected'
+      this.connections.okx.phase !== 'connected' ||
+      this.telegram !== telegramMonitor ||
+      this.telegramLifecycleRevision !== telegramLifecycleRevision ||
+      !telegramMonitor.liveTradingReadiness.ready ||
+      telegramMonitor.liveTradingReadiness.revision !== telegramRevision
     ) {
-      throw new Error('OKX 连接在交易前检查期间发生变化，请重新连接')
+      throw new Error('OKX 连接在交易前检查期间发生变化，或 Telegram 正在恢复，请重新确认')
     }
     client.setLiveTradingArmed(true)
+    this.liveArmRevision += 1
+    this.liveArmCapability = Object.freeze({})
     this.liveArmed = true
     this.armedAt = this.now()
     this.emergencyStopped = false
@@ -840,9 +881,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
       await this.notify('warning', '实盘已解锁', '新消息可能触发真实 OKX 市价单；重启后会自动锁定')
       this.emitSnapshot()
     } catch (error) {
-      this.liveArmed = false
-      this.armedAt = undefined
-      client.setLiveTradingArmed(false)
+      this.invalidateOkxOpeningCapability()
       this.emitSnapshot()
       await this.audit.write('live_trading_arm_rolled_back', 'critical', {
         error: errorText(error)
@@ -853,15 +892,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   async disarmLiveTrading(reason?: string): Promise<void> {
     const wasArmed = this.liveArmed
-    this.liveArmed = false
-    this.armedAt = undefined
-    // A user-confirmed reduce-only close owns a one-time client capability.
-    // Controller opening permission is already false, so unrelated signal,
-    // Telegram, or AI disarm events must not invalidate that risk-reducing
-    // request while it is crossing the exchange boundary.
-    if (this.okx && this.okx !== this.closeScopedArmedClient) {
-      this.okx.setLiveTradingArmed(false)
-    }
+    this.invalidateOkxOpeningCapability()
     if (wasArmed) {
       await this.audit.write('live_trading_disarmed', 'warning', { reason })
       if (reason) await this.notify('warning', '实盘已锁定', reason)
@@ -870,6 +901,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async emergencyStop(): Promise<void> {
+    this.monitoringRevision += 1
     this.monitoring = false
     this.emergencyStopped = true
     await this.disarmLiveTrading()
@@ -1088,13 +1120,16 @@ export class AppController extends EventEmitter<ControllerEvents> {
   async dispose(): Promise<void> {
     if (this.closing) return
     this.closing = true
+    this.monitoringRevision += 1
     this.monitoring = false
-    this.liveArmed = false
-    this.okx?.setLiveTradingArmed(false)
+    this.invalidateOkxOpeningCapability()
     const client = this.okx
     const stream = this.okxStream
     await this.telegram?.stop().catch(() => undefined)
-    this.telegram = undefined
+    if (this.telegram) {
+      this.telegram = undefined
+      this.telegramLifecycleRevision += 1
+    }
     await this.coordinator.shutdown()
     await this.activePositionClose?.catch(() => undefined)
     if (client) {
@@ -1156,7 +1191,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   private async handleTelegramError(event: TelegramMonitorError): Promise<void> {
-    // Recoverable GramJS errors are diagnostic signals only. Confirmed
+    // Recoverable teleproto errors are diagnostic signals only. Confirmed
     // transport changes are published through handleTelegramStatus(), which
     // remains the single authority that revokes live trading.
     if (!event.recoverable) {
@@ -1662,7 +1697,47 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.invalidateOkxOpeningCapability()
   }
 
+  private currentSignalTradeAuthorization(): SignalTradeAuthorizationToken | undefined {
+    const telegramMonitor = this.telegram
+    const telegramReadiness = telegramMonitor?.liveTradingReadiness
+    if (
+      !this.monitoring ||
+      !this.liveArmed ||
+      !this.liveArmCapability ||
+      !telegramMonitor ||
+      !telegramReadiness?.ready
+    ) {
+      return undefined
+    }
+    return Object.freeze({
+      capability: this.liveArmCapability,
+      armRevision: this.liveArmRevision,
+      monitoringRevision: this.monitoringRevision,
+      telegramLifecycleRevision: this.telegramLifecycleRevision,
+      telegramRecoveryRevision: telegramReadiness.revision,
+      telegramMonitor
+    })
+  }
+
+  private assertSignalTradeAuthorization(
+    expected: SignalTradeAuthorizationToken,
+    client: OkxV5Client
+  ): void {
+    if (
+      !sameSignalTradeAuthorization(this.currentSignalTradeAuthorization(), expected) ||
+      this.emergencyStopped ||
+      this.okx !== client ||
+      this.connections.okx.phase !== 'connected' ||
+      !client.isLiveTradingArmed ||
+      this.hasPositionCloseInterlock()
+    ) {
+      throw new Error('消息到达后的实盘授权、Telegram 连接或 OKX 安全状态已变化')
+    }
+  }
+
   private invalidateOkxOpeningCapability(): void {
+    this.liveArmRevision += 1
+    this.liveArmCapability = undefined
     this.liveArmed = false
     this.armedAt = undefined
     if (this.okx && this.okx !== this.closeScopedArmedClient) {
@@ -1814,6 +1889,9 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   private armBlockers(): string[] {
     const blockers = this.connectionBlockers()
+    if (this.telegram && !this.telegram.liveTradingReadiness.ready) {
+      blockers.push('Telegram 正在校验断线补拉')
+    }
     if (!this.monitoring) blockers.push('监听尚未开启')
     if (this.emergencyStopped) blockers.push('当前处于紧急停止状态，请先重新开启监听')
     if (this.coordinator.hasPendingOrder) blockers.push('开仓订单仍在等待最终状态或只读对账')

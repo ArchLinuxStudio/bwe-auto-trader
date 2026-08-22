@@ -31,3 +31,5 @@ audit/
 # Temporary review and QA directories
 .tmp*/
 .tmp-*/
+release-*-qa*/
+release-v*/

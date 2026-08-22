@@ -18,6 +18,21 @@ export interface SignalSafetySnapshot {
   okxConnected: boolean
   emergencyStopped: boolean
   positionCloseInProgress: boolean
+  /**
+   * Current opaque, process-local capability. Telegram captures this at the
+   * raw NewMessage boundary; every monitoring, arm, lifecycle, and recovery
+   * generation must still match when the order is transmitted.
+   */
+  authorizationToken?: SignalTradeAuthorizationToken
+}
+
+export interface SignalTradeAuthorizationToken {
+  readonly capability: object
+  readonly armRevision: number
+  readonly monitoringRevision: number
+  readonly telegramLifecycleRevision: number
+  readonly telegramRecoveryRevision: number
+  readonly telegramMonitor: object
 }
 
 export interface OpenTradeResult {
@@ -68,6 +83,7 @@ export interface SignalCoordinatorDependencies {
     direction: 'LONG' | 'SHORT'
     targetNotionalUsdt: number
     deadlineAt: number
+    authorizationToken: SignalTradeAuthorizationToken
   }): Promise<OpenTradeResult>
   settings(): TradingSettings
   safety(): SignalSafetySnapshot
@@ -84,6 +100,22 @@ export interface SignalCoordinatorDependencies {
 
 const TERMINAL_ORDER_STATES = new Set(['filled', 'canceled', 'rejected', 'failed', 'mmp_canceled'])
 const EARLY_ORDER_UPDATE_LIMIT = 200
+
+export function sameSignalTradeAuthorization(
+  current: SignalTradeAuthorizationToken | undefined,
+  expected: SignalTradeAuthorizationToken | undefined
+): boolean {
+  return Boolean(
+    current &&
+    expected &&
+    current.capability === expected.capability &&
+    current.telegramMonitor === expected.telegramMonitor &&
+    current.armRevision === expected.armRevision &&
+    current.monitoringRevision === expected.monitoringRevision &&
+    current.telegramLifecycleRevision === expected.telegramLifecycleRevision &&
+    current.telegramRecoveryRevision === expected.telegramRecoveryRevision
+  )
+}
 
 /**
  * Fail-closed bridge from untrusted channel text to the live-order capability.
@@ -133,9 +165,12 @@ export class SignalCoordinator {
     }
   }
 
-  process(message: TelegramMessagePayload): Promise<SignalRecord | undefined> {
+  process(
+    message: TelegramMessagePayload,
+    ingressAuthorization?: SignalTradeAuthorizationToken
+  ): Promise<SignalRecord | undefined> {
     if (!this.accepting) return Promise.resolve(undefined)
-    const task = this.processInternal(message)
+    const task = this.processInternal(message, ingressAuthorization)
     this.activeProcesses.add(task)
     void task.then(
       () => this.activeProcesses.delete(task),
@@ -149,12 +184,19 @@ export class SignalCoordinator {
     await Promise.allSettled([...this.activeProcesses])
   }
 
-  private async processInternal(message: TelegramMessagePayload): Promise<SignalRecord | undefined> {
+  private async processInternal(
+    message: TelegramMessagePayload,
+    ingressAuthorization?: SignalTradeAuthorizationToken
+  ): Promise<SignalRecord | undefined> {
     const key = `${message.channelId}:${message.messageId}`
     if (this.seen.has(key)) return undefined
     this.rememberMessage(key)
 
     const safety = this.dependencies.safety()
+    // `ingressAuthorization` was captured synchronously by Telegram's raw
+    // NewMessage handler. Never substitute the current safety token here: this
+    // method may begin only after FIFO/setImmediate scheduling, by which point
+    // a message received while locked could otherwise be retroactively armed.
     if (!safety.monitoring || safety.emergencyStopped || safety.positionCloseInProgress) {
       await this.audit('signal_ignored_monitoring_off', {
         channelId: message.channelId,
@@ -212,6 +254,19 @@ export class SignalCoordinator {
     record = { ...record, analysis, updatedAt: this.now() }
     await this.publish(record)
 
+    // A fast reconnect can replay a genuinely recent publication. Analyze it
+    // for visibility, but preserve the transport epoch on the payload so a
+    // later manual re-arm cannot retroactively authorize that replay.
+    if (message.recovered) {
+      record = await this.update(record, 'skipped', '重连或启动补拉消息仅展示 AI 结果，永不触发下单')
+      await this.audit('signal_skipped_recovered_delivery', {
+        signalId: record.id,
+        publishedAt: message.date,
+        receivedAt: message.receivedAt
+      })
+      return record
+    }
+
     if (result.status !== 'ok' || result.decision === 'SKIP') {
       const reason = result.failureCode
         ? `AI 未给出可执行信号（${failureLabel(result.failureCode)}）：${result.reason}`
@@ -239,6 +294,12 @@ export class SignalCoordinator {
       return record
     }
 
+    if (!ingressAuthorization) {
+      record = await this.update(record, 'blocked', '消息到达时实盘尚未解锁，仅展示 AI 分析结果')
+      await this.notice('warning', '消息到达时实盘未解锁，未下单', `${symbol} ${analysis.decision}`)
+      return record
+    }
+
     const latestSafety = this.dependencies.safety()
     if (!latestSafety.monitoring || latestSafety.emergencyStopped) {
       return this.update(record, 'blocked', '分析期间监听已停止，未下单')
@@ -251,9 +312,12 @@ export class SignalCoordinator {
     if (latestSafety.positionCloseInProgress) {
       return this.update(record, 'blocked', '平仓操作仍在处理或等待最终状态，未开新仓')
     }
-    if (!latestSafety.liveArmed) {
-      record = await this.update(record, 'blocked', 'AI 已给出方向，但实盘尚未解锁，未下单')
-      await this.notice('warning', '实盘未解锁，未下单', `${symbol} ${analysis.decision} · ${analysis.reason}`)
+    if (
+      !latestSafety.liveArmed ||
+      !sameSignalTradeAuthorization(latestSafety.authorizationToken, ingressAuthorization)
+    ) {
+      record = await this.update(record, 'blocked', '消息到达后的实盘授权或 Telegram 连接代次已变化，未下单')
+      await this.notice('warning', '实盘授权已变化，未下单', `${symbol} ${analysis.decision} · ${analysis.reason}`)
       return record
     }
 
@@ -290,6 +354,7 @@ export class SignalCoordinator {
       !finalSafety.monitoring ||
       finalSafety.emergencyStopped ||
       !finalSafety.liveArmed ||
+      !sameSignalTradeAuthorization(finalSafety.authorizationToken, ingressAuthorization) ||
       finalSafety.positionCloseInProgress
     ) {
       return this.update(record, 'blocked', '交易前安全状态已变化，未下单')
@@ -343,7 +408,8 @@ export class SignalCoordinator {
         symbol,
         direction,
         targetNotionalUsdt: settings.orderNotionalUsdt,
-        deadlineAt: message.receivedAt + SIGNAL_TRADE_DEADLINE_MS
+        deadlineAt: message.receivedAt + SIGNAL_TRADE_DEADLINE_MS,
+        authorizationToken: ingressAuthorization
       })
     } catch (error) {
       let disposition: TradeErrorDisposition = { kind: 'failed' }

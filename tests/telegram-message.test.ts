@@ -37,10 +37,11 @@ describe('extractTelegramSignalMessage', () => {
       hasMedia: false,
       mediaKind: undefined,
       postAuthor: 'BWE',
+      recovered: false,
     })
   })
 
-  it('uses the GramJS message field as a photo caption', () => {
+  it('uses the teleproto message field as a photo caption', () => {
     const result = extractTelegramSignalMessage(
       {
         id: 7,
@@ -54,6 +55,20 @@ describe('extractTelegramSignalMessage', () => {
     expect(result?.text).toBe('BTC ETF approved')
     expect(result?.hasMedia).toBe(true)
     expect(result?.mediaKind).toBe('MessageMediaPhoto')
+  })
+
+  it('falls back to teleproto richText without an extra network fetch', () => {
+    const result = extractTelegramSignalMessage(
+      {
+        id: 8,
+        message: '',
+        richText: '  BTC treasury purchase announced  ',
+        date: new Date('2026-08-12T01:00:00.000Z'),
+      },
+      { channelUsername: '@BWEnews', receivedAt: new Date('2026-08-12T01:00:01.000Z') },
+    )
+
+    expect(result?.text).toBe('BTC treasury purchase announced')
   })
 
   it('maps a transport event to the app payload contract', () => {
@@ -74,6 +89,7 @@ describe('extractTelegramSignalMessage', () => {
       date: 1_700_000_000_000,
       receivedAt: Date.parse('2026-08-12T01:00:00.000Z'),
       permalink: 'https://t.me/BWEnews/12',
+      recovered: false,
     })
   })
 
@@ -85,16 +101,29 @@ describe('extractTelegramSignalMessage', () => {
     expect(extractTelegramSignalMessage(raw, { channelUsername: 'BWEnews' })).toBeNull()
   })
 
-  it('uses the current time only when Telegram did not provide a date', () => {
+  it.each([
+    ['missing', undefined],
+    ['NaN', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+    ['milliseconds instead of seconds', Date.parse('2026-08-12T08:00:00.000Z')],
+    ['invalid Date', new Date(Number.NaN)],
+  ])('rejects a %s Telegram publication date', (_label, date) => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-12T08:00:00.000Z'))
     const result = extractTelegramSignalMessage(
-      { id: 9, message: 'news' },
+      { id: 9, message: 'news', date },
       { channelUsername: 'BWEnews' },
     )
-    expect(result?.publishedAt).toBe('2026-08-12T08:00:00.000Z')
-    expect(result?.receivedAt).toBe('2026-08-12T08:00:00.000Z')
+    expect(result).toBeNull()
     vi.useRealTimers()
+  })
+
+  it('rejects a Telegram publication date more than five minutes in the future', () => {
+    const result = extractTelegramSignalMessage(
+      { id: 9, message: 'news', date: new Date('2026-08-12T08:05:01.000Z') },
+      { channelUsername: 'BWEnews', receivedAt: new Date('2026-08-12T08:00:00.000Z') },
+    )
+    expect(result).toBeNull()
   })
 })
 
