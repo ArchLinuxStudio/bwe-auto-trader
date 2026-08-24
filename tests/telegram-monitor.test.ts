@@ -19,6 +19,12 @@ import {
 
 interface TelegramMonitorHarness {
   processingTail: Promise<void>
+  bufferingInitialMessages: boolean
+  initialMessageBuffer: Array<{
+    raw: unknown
+    receivedAt: Date
+    recovered: boolean
+  }>
   disconnectedChecks: number
   reconnecting: boolean
   recoveryPending: boolean
@@ -57,6 +63,7 @@ function createMonitor(
     TelegramMonitorOptions,
     'catchUpLimit' | 'healthCheckIntervalMs' | 'stopDrainTimeoutMs' | 'captureAuthorization'
   >> = {},
+  onMessageObserved?: (message: TelegramSignalMessage) => void | Promise<void>,
 ): { monitor: TelegramMonitor; harness: TelegramMonitorHarness } {
   const monitor = new TelegramMonitor({
     apiId: 1,
@@ -65,7 +72,7 @@ function createMonitor(
       get: async () => undefined,
       set: async () => undefined,
     },
-    callbacks: { onMessage, onError, onStatus },
+    callbacks: { onMessage, onMessageObserved, onError, onStatus },
     ...monitorOptions,
   })
 
@@ -331,6 +338,112 @@ describe('TelegramMonitor message dispatch', () => {
     expect(delivered[0]?.recovered).toBe(true)
     expect(statuses).toEqual([])
     expect(client.checkAuthorization).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows a recovery-buffered live update before catch-up settles and dispatches it only once', async () => {
+    let releaseCatchUp!: (messages: unknown[]) => void
+    const catchUpBarrier = new Promise<unknown[]>((resolve) => {
+      releaseCatchUp = resolve
+    })
+    const observed: TelegramSignalMessage[] = []
+    const delivered: TelegramSignalMessage[] = []
+    const rawMessage = {
+      id: 89,
+      message: 'recovery-visible immediately',
+      date: Math.floor(Date.now() / 1_000),
+    }
+    const client = {
+      connected: true,
+      getMessages: vi.fn(() => catchUpBarrier),
+      checkAuthorization: vi.fn(async () => true),
+      addEventHandler: vi.fn(),
+    }
+    const { harness } = createMonitor(
+      (message) => {
+        delivered.push(message)
+      },
+      undefined,
+      undefined,
+      {},
+      (message) => {
+        observed.push(message)
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = client
+    harness.installConnectionStateHandler(client)
+
+    harness.connectionEventHandler?.(
+      new UpdateConnectionState(UpdateConnectionState.broken),
+    )
+    harness.connectionEventHandler?.(
+      new UpdateConnectionState(UpdateConnectionState.connected),
+    )
+    await vi.waitFor(() => expect(client.getMessages).toHaveBeenCalledOnce())
+
+    await harness.handleNewMessageEvent({ message: rawMessage })
+    await flushMessageDispatches()
+
+    expect(harness.recoveryPending).toBe(true)
+    expect(harness.recoveryPromise).toBeDefined()
+    expect(delivered).toHaveLength(0)
+    expect(observed).toHaveLength(1)
+    expect(observed[0]).toMatchObject({
+      messageId: 89,
+      text: 'recovery-visible immediately',
+      recovered: true,
+    })
+
+    releaseCatchUp([rawMessage])
+    await harness.recoveryPromise
+    await flushMessageDispatches()
+
+    expect(harness.recoveryPending).toBe(false)
+    expect(observed).toHaveLength(1)
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]).toMatchObject({ messageId: 89, recovered: true })
+  })
+
+  it('shows a startup-buffered live update before the startup gate opens', async () => {
+    const observed: TelegramSignalMessage[] = []
+    const delivered: TelegramSignalMessage[] = []
+    const { harness } = createMonitor(
+      (message) => {
+        delivered.push(message)
+      },
+      undefined,
+      undefined,
+      {},
+      (message) => {
+        observed.push(message)
+      },
+    )
+    const rawMessage = {
+      id: 90,
+      message: 'startup-visible immediately',
+      date: Math.floor(Date.now() / 1_000),
+    }
+    harness.channelEntity = {}
+    harness.bufferingInitialMessages = true
+
+    await harness.handleNewMessageEvent({ message: rawMessage })
+    await flushMessageDispatches()
+
+    expect(harness.initialMessageBuffer).toHaveLength(1)
+    expect(delivered).toHaveLength(0)
+    expect(observed).toHaveLength(1)
+    expect(observed[0]).toMatchObject({ messageId: 90, recovered: true })
+
+    const [queued] = harness.initialMessageBuffer
+    harness.initialMessageBuffer = []
+    harness.bufferingInitialMessages = false
+    await harness.enqueueRawMessage(queued!.raw, queued!.receivedAt, queued!.recovered)
+    await flushMessageDispatches()
+
+    expect(observed).toHaveLength(1)
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]).toMatchObject({ messageId: 90, recovered: true })
   })
 
   it('publishes reconnecting only after two consecutive disconnected samples', async () => {
@@ -690,6 +803,46 @@ describe('TelegramMonitor message dispatch', () => {
       id: 500,
       message: 'callback never settles',
       date: Math.floor(Date.now() / 1_000),
+    })
+    await started
+    const startedAt = Date.now()
+    await monitor.stop()
+
+    expect(Date.now() - startedAt).toBeLessThan(500)
+    expect(monitor.state).toBe('stopped')
+  })
+
+  it('bounds stop even when a display-only observation never settles', async () => {
+    let observationStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      observationStarted = resolve
+    })
+    const never = new Promise<void>(() => undefined)
+    const { monitor, harness } = createMonitor(
+      () => undefined,
+      undefined,
+      undefined,
+      { stopDrainTimeoutMs: 20 },
+      async () => {
+        observationStarted()
+        await never
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.bufferingInitialMessages = true
+    harness.channelEntity = {}
+    harness.client = {
+      connected: true,
+      getMessages: vi.fn(async () => []),
+      destroy: vi.fn(async () => undefined),
+    }
+
+    await harness.handleNewMessageEvent({
+      message: {
+        id: 501,
+        message: 'observation never settles',
+        date: Math.floor(Date.now() / 1_000),
+      },
     })
     await started
     const startedAt = Date.now()

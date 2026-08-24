@@ -1,0 +1,145 @@
+# Known Issues and Limitations
+
+Only current limitations, reproducible environment problems, and active workarounds belong here. Resolved bugs are retained only in [`DECISIONS.md`](DECISIONS.md) when their lesson constrains future work.
+
+## Cross-client unknown may remain locked indefinitely
+
+Symptoms: If the client that originated an ambiguous mutation is gone—including after process restart—the durable record remains locked when a replacement client sees no matching order. A position effect without an exact matching terminal order is recorded as evidence but also does not release the recovered record. While any recovered record remains unresolved, the explicit connection attempt fails before creating the private WebSocket, so the application does not continuously observe that order's later terminal state.
+
+Impact: Automation can remain safely unavailable until a human establishes the exchange outcome.
+
+Cause: The existing bounded absence rule depends on repeated evidence from the same originating client. The mutation journal preserves identity and expiry evidence, but the accepted cross-client consistency/absence model is not yet complete.
+
+Already excluded: One not-found response, a short timer, or credential replacement is not sufficient proof. Those approaches can miss delayed exchange visibility or a late fill.
+
+Current workaround: Do not retry, switch credentials to clear state, edit the journal, or assume absence. Re-run explicit GET-only recovery only with the matching sub-account, verify the outcome in the official OKX client, and remain locked if evidence is absent or conflicts.
+
+Next direction: Specify and test the cross-client evidence model in `TODO.md` before changing release behavior.
+
+## No real private-service end-to-end verification
+
+Symptoms: All automated tests use mocks/injected transports. Windows build/cold-start verification proves packaging and startup, not Telegram delivery, ChatGPT account behavior, or an OKX real order lifecycle.
+
+Impact: The first real approximately 10 USDT order and close may expose integration behavior not represented by mocks.
+
+Current workaround: Only perform a user-authorized, dedicated-sub-account, minimal-fund, actively supervised test while the official OKX client is open. Never use a real private call as an unattended smoke test.
+
+Next direction: Follow the first P1 item in `TODO.md` and record only non-sensitive results.
+
+## Not suitable for unattended operation
+
+Symptoms: There is no automatic stop loss, take profit, maximum holding time, time-based close, background service, or exit-time close. Emergency stop and application exit do not close an existing position.
+
+Impact: Exposure can remain after the application stops or the signal pipeline becomes unavailable.
+
+Cause: This is the user-confirmed initial scope, not an unfinished hidden feature.
+
+Current workaround: Use minimal funds, active human supervision, and the official OKX client. Use the independent manual `reduceOnly` close path when appropriate.
+
+Next direction: Only design automated exit risk if the user explicitly expands scope.
+
+## macOS and Linux are not release-verified
+
+Symptoms: Package scripts exist, but native packages, secure storage, proxy behavior, Codex platform binaries, UI, signing, and cold start have not been verified. The reviewed Electron runtime manifest currently has a Windows x64 profile only.
+
+Impact: A non-Windows dependency check/package may fail closed because no unique reviewed runtime profile exists, and the application must not be advertised as having verified three-platform binaries.
+
+Current workaround: Treat macOS/Linux as source/build intent only.
+
+Next direction: Build each target on a native runner and complete the target-specific compliance profile described in `TODO.md`.
+
+## OKX disconnect UI can understate retained exposure uncertainty
+
+Symptoms: After disconnect, the visible current position list can be empty while the controller retains old-account exposure facts and blocks unsafe credential changes.
+
+Impact: The safety behavior is correct, but the user may interpret “0 positions” as a fresh exchange fact.
+
+Current workaround: Use the connection state and official OKX client as the source of current exposure after disconnect. Do not weaken the retained internal block.
+
+Next direction: Add an explicit “old account exposure not freshly verified” state instead of clearing safety facts.
+
+## Saving identical OKX credentials can revoke live authorization without a clear explanation
+
+Symptoms: A repeated save of the same account does not switch accounts or clear order state, but lifecycle reservation revokes the live-open capability.
+
+Impact: The user may think the application locked itself unexpectedly.
+
+Cause: Safety revocation happens at the start of an account lifecycle operation; UI messaging does not distinguish an identical save.
+
+Current workaround: Re-arm manually only after all connections and safety blockers are healthy.
+
+Next direction: Improve the notification without removing lifecycle revocation.
+
+## Windows artifacts are unsigned and use the default Electron icon
+
+Symptoms: Windows reports the application and installer as `NotSigned`; SmartScreen may warn. The bundled OpenAI Codex executable may have a valid upstream signature, but that does not sign this application.
+
+Impact: Lower installation trust and less clear application identity.
+
+Current workaround: Verify the release SHA-256 values in `CURRENT_STATE.md`/`SHA256SUMS.txt` and communicate the warning accurately.
+
+Next direction: Add project publisher signing and branding before treating distribution as polished.
+
+## Telegram and content support is intentionally narrow
+
+Symptoms:
+
+- Only text and caption-like message content is analyzed; images, OCR, linked pages, and attachments are not fetched.
+- Standard phone number, code, and 2FA password prompts are implemented. Rare email-code or CAPTCHA flows are not.
+- Monitoring exists only while the application is open and the user starts it.
+
+Impact: Some posts or unusual login flows are safely skipped or fail instead of being analyzed/bypassed.
+
+Current workaround: Do not infer content that was not extracted and do not bypass Telegram security. Handle unsupported login requirements through the official Telegram flow.
+
+Next direction: Expand only after a concrete user requirement and safe reproduction.
+
+## Positions cannot be attributed exclusively to this application
+
+Symptoms: OKX returns the dedicated sub-account's complete SWAP position set, including positions that might come from the official client or another tool.
+
+Impact: Calling these “positions created by this application” would be false and can hide external activity.
+
+Current workaround: Keep UI and docs wording as “all SWAP positions in the dedicated sub-account.”
+
+Next direction: Persist order provenance and reconcile external orders if attribution becomes a requirement.
+
+## Packaging and license boundaries require artifact-level verification
+
+Symptoms:
+
+- Historical or intermediate build artifacts can carry a different dependency closure; a filename or local directory name is not provenance evidence.
+- Electron/Chromium runtime notices include LGPL components even though the application npm/ASAR production closure no longer contains the retired GramJS GPL chain.
+
+Impact: Renaming or uploading a historical/intermediate artifact could publish the wrong dependency set. Claiming the complete Electron bundle is free of every GPL-family/weak-copyleft component would be inaccurate.
+
+Current workaround: Use the exact current release identity and hashes in `CURRENT_STATE.md`, and use the accepted license boundary in `DECISIONS.md`. Preserve project/third-party/Electron/Chromium license files. Never glob-upload a local release directory.
+
+Already tried: Putting the same NOTICE sources in both ASAR `files` and `extraFiles` failed because electron-builder excludes duplicate extra-file sources from ASAR; afterPack correctly reported `app.asar does not contain THIRD_PARTY_NOTICES.txt`.
+
+Current solution: Keep visible compliance files at the application/ZIP root via `extraFiles` and validate them there in `scripts/after-pack-license-check.cjs`.
+
+## Windows build access can fail because of local network/cache behavior
+
+Symptoms and reproducibility:
+
+- International downloads may fail with `unable to verify the first certificate` on this machine.
+- Electron cache relocation has intermittently failed with `rename EPERM`.
+
+Already tried: Repeating the same network/cache operation without changing the process environment was not reliable. Global proxy changes are unnecessary and undesirable.
+
+Current workarounds:
+
+```powershell
+$env:NODE_USE_SYSTEM_CA='1'
+$env:HTTP_PROXY='http://127.0.0.1:7890'
+$env:HTTPS_PROXY='http://127.0.0.1:7890'
+```
+
+If the pinned local Electron distribution is already installed and verified:
+
+```powershell
+.\node_modules\.bin\electron-builder.cmd --win nsis zip --x64 --config.electronDist=node_modules/electron/dist
+```
+
+Next direction: Keep workarounds process-local. Do not turn them into application routing logic or global machine settings.

@@ -14,7 +14,8 @@ import {
   createOkxRestSignature,
   createOkxWebSocketLoginSignature,
   okxPositionsToAppPositions,
-  type FetchLike
+  type FetchLike,
+  type OkxMutationLifecycleEvent
 } from '../../src/main/services/okx'
 import type {
   OkxWebSocketOptions,
@@ -46,6 +47,9 @@ interface TradingHarnessOptions {
     init: RequestInit | undefined,
     body: Record<string, unknown>
   ) => Response | Promise<Response>
+  onMutationLifecycle?: (
+    event: Readonly<OkxMutationLifecycleEvent>
+  ) => void | Promise<void>
 }
 
 function createTradingHarness(options: TradingHarnessOptions = {}): {
@@ -133,7 +137,8 @@ function createTradingHarness(options: TradingHarnessOptions = {}): {
       fetchImpl,
       allowCustomEndpointsForTesting: true,
       now: options.now,
-      randomId: () => 'abcdef0123456789'
+      randomId: () => 'abcdef0123456789',
+      onMutationLifecycle: options.onMutationLifecycle
     }),
     fetchImpl
   }
@@ -1248,6 +1253,144 @@ describe('live trading interlock', () => {
     expect(client.requiresOrderReconciliation).toBe(false)
   })
 
+  it('awaits the durable transmission marker and then rechecks the final guard before POST', async () => {
+    let releaseTransmission!: () => void
+    const transmissionGate = new Promise<void>((resolve) => {
+      releaseTransmission = resolve
+    })
+    const events: OkxMutationLifecycleEvent[] = []
+    const harness = createTradingHarness({
+      onMutationLifecycle: async (event) => {
+        events.push({ ...event })
+        if (event.phase === 'transmitting') await transmissionGate
+      }
+    })
+    await harness.client.verifyAccountConfiguration()
+    harness.client.setLiveTradingArmed(true)
+    const intent = await harness.client.prepareMarketOrder(
+      { symbolOrInstId: 'BTC', direction: 'LONG' },
+      2_000
+    )
+
+    const submission = harness.client.submitPreparedMarketOrder({
+      intent,
+      arm: harness.client.armNextLiveTrade('open')
+    })
+    await vi.waitFor(() => {
+      expect(events.map((event) => event.phase)).toContain('transmitting')
+    })
+    expect(
+      harness.fetchImpl.mock.calls.some(
+        ([input]) => new URL(input).pathname === '/api/v5/trade/order'
+      )
+    ).toBe(false)
+
+    harness.client.setLiveTradingArmed(false)
+    releaseTransmission()
+    await expect(submission).rejects.toBeInstanceOf(OkxLiveTradingNotArmedError)
+    expect(events.map((event) => event.phase)).toEqual([
+      'prepared',
+      'transmitting',
+      'terminal'
+    ])
+    expect(events.at(-1)).toMatchObject({
+      terminalEvidence: 'not_transmitted'
+    })
+    expect(
+      harness.fetchImpl.mock.calls.some(
+        ([input]) => new URL(input).pathname === '/api/v5/trade/order'
+      )
+    ).toBe(false)
+  })
+
+  it('persists prepared, transmitting, and ACK evidence before returning success', async () => {
+    const now = 1_754_960_400_000
+    const events: OkxMutationLifecycleEvent[] = []
+    const { client } = createTradingHarness({
+      now: () => now,
+      onMutationLifecycle: (event) => {
+        expect(Object.isFrozen(event)).toBe(true)
+        events.push({ ...event })
+      }
+    })
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+
+    await expect(client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: client.armNextLiveTrade('open')
+    })).resolves.toMatchObject({ ordId: '123456789' })
+
+    expect(events.map((event) => event.phase)).toEqual([
+      'prepared',
+      'transmitting',
+      'accepted'
+    ])
+    expect(events[0]).toMatchObject({
+      operation: 'open',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: expect.stringMatching(/^bwe/)
+    })
+    expect(events[1]).toMatchObject({ exchangeExpiresAt: now + 5_000 })
+    expect(events[2]).toMatchObject({ ordId: '123456789' })
+  })
+
+  it('keeps the durable precommit and marks unknown after an ambiguous POST', async () => {
+    const events: OkxMutationLifecycleEvent[] = []
+    const { client } = createTradingHarness({
+      onOrder: () => {
+        throw new Error('socket reset after write')
+      },
+      onMutationLifecycle: (event) => {
+        events.push({ ...event })
+      }
+    })
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+
+    await expect(client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: client.armNextLiveTrade('open')
+    })).rejects.toBeInstanceOf(OkxOrderStateUnknownError)
+    expect(events.map((event) => event.phase)).toEqual([
+      'prepared',
+      'transmitting',
+      'unknown'
+    ])
+  })
+
+  it('records a definitive exchange rejection as terminal instead of unknown', async () => {
+    const events: OkxMutationLifecycleEvent[] = []
+    const { client } = createTradingHarness({
+      onOrder: (_url, _init, body) => okJson([{
+        ordId: '',
+        clOrdId: body.clOrdId,
+        sCode: '51000',
+        sMsg: 'Parameter error'
+      }]),
+      onMutationLifecycle: (event) => {
+        events.push({ ...event })
+      }
+    })
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+
+    await expect(client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: client.armNextLiveTrade('open')
+    })).rejects.toThrow('Parameter error')
+    expect(events.map((event) => event.phase)).toEqual([
+      'prepared',
+      'transmitting',
+      'terminal'
+    ])
+    expect(events.at(-1)).toMatchObject({ terminalEvidence: 'rejected' })
+    expect(client.requiresOrderReconciliation).toBe(false)
+  })
+
   it('re-checks emergency disarm after a last-moment time sync and before fetch', async () => {
     let now = 1_754_960_400_000
     let timeRequests = 0
@@ -1548,6 +1691,7 @@ describe('live trading interlock', () => {
 describe('full-position reduce-only close', () => {
   it('closes the exact signed net position with the opposite side and reduceOnly', async () => {
     const requestBodies: Array<Record<string, unknown>> = []
+    const mutationEvents: OkxMutationLifecycleEvent[] = []
     const fetchImpl = vi.fn<FetchLike>(async (input, init) => {
       const url = new URL(input)
       if (url.pathname === '/api/v5/trade/orders-pending') return okJson([])
@@ -1578,7 +1722,10 @@ describe('full-position reduce-only close', () => {
     const client = new OkxV5Client({
       credentials,
       fetchImpl,
-      allowCustomEndpointsForTesting: true
+      allowCustomEndpointsForTesting: true,
+      onMutationLifecycle: (event) => {
+        mutationEvents.push({ ...event })
+      }
     })
     client.setLiveTradingArmed(true)
     const result = await client.closeEntirePosition({
@@ -1602,6 +1749,15 @@ describe('full-position reduce-only close', () => {
       ordType: 'market',
       sz: '2.5',
       reduceOnly: true
+    })
+    expect(mutationEvents.map((event) => event.phase)).toEqual([
+      'prepared',
+      'transmitting',
+      'accepted'
+    ])
+    expect(mutationEvents[0]).toMatchObject({
+      operation: 'close',
+      instId: 'ETH-USDT-SWAP'
     })
     const pendingOrderUrl = fetchImpl.mock.calls
       .map(([input]) => new URL(input))

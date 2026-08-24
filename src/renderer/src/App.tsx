@@ -28,6 +28,7 @@ import type {
   TelegramCredentialsInput,
   TradeDecision,
 } from '@shared/types'
+import { presentNetworkDiagnostics } from './network-diagnostics-view'
 
 type View = 'dashboard' | 'settings'
 type ToastItem = NotificationItem & { local?: boolean }
@@ -63,7 +64,7 @@ const EMPTY_SETTINGS: PublicSettings = {
 }
 
 const EMPTY_SNAPSHOT: AppSnapshot = {
-  version: '0.1.6',
+  version: '0.1.7',
   connections: {
     telegram: EMPTY_STATUS,
     chatgpt: EMPTY_STATUS,
@@ -85,6 +86,7 @@ const EMPTY_SNAPSHOT: AppSnapshot = {
   positions: [],
   signals: [],
   notifications: [],
+  aiQuotaExhausted: false,
 }
 
 const PHASE_LABELS: Record<ConnectionPhase, string> = {
@@ -303,6 +305,7 @@ function App(): JSX.Element {
   }
 
   const totalPnl = snapshot.positions.reduce((sum, position) => sum + position.unrealizedPnl, 0)
+  const chatGptDisplayStatus = quotaAwareChatGptStatus(snapshot)
   const connectedCount = Object.values(snapshot.connections).filter(
     (connection) => connection.phase === 'connected',
   ).length
@@ -372,7 +375,12 @@ function App(): JSX.Element {
 
           <div className="topbar-statuses">
             <ConnectionPill name="Telegram" status={snapshot.connections.telegram} icon={<TelegramIcon />} />
-            <ConnectionPill name="ChatGPT" status={snapshot.connections.chatgpt} icon={<SparkIcon />} />
+            <ConnectionPill
+              name="ChatGPT"
+              status={chatGptDisplayStatus}
+              displayLabel={snapshot.aiQuotaExhausted ? '额度用尽' : undefined}
+              icon={<SparkIcon />}
+            />
             <ConnectionPill name="OKX" status={snapshot.connections.okx} icon={<OkxIcon />} />
           </div>
 
@@ -736,6 +744,21 @@ function SettingsView({
 
   const api = getDesktopApi()
 
+  const diagnoseNetwork = async (): Promise<void> => {
+    if (!api) return
+    const result = await runAction('diagnostics', () => api.runNetworkDiagnostics())
+    if (!result.ok || !result.value) return
+
+    const presentation = presentNetworkDiagnostics(result.value)
+    notifyLocal(
+      presentation.incompleteItems.length > 0 ? 'warning' : 'success',
+      '网络诊断已完成',
+      presentation.incompleteItems.length > 0
+        ? `检测流程已完成；以下项目未通过：${presentation.incompleteItems.join('、')}`
+        : '直连、Clash 与 OKX 可选端点探针均已通过'
+    )
+  }
+
   useEffect(() => {
     setSettings((current) => ({
       ...current,
@@ -941,22 +964,35 @@ function SettingsView({
           number="02"
           title="ChatGPT Plus"
           subtitle="通过官方 Codex 登录进行极速新闻分析"
-          status={snapshot.connections.chatgpt}
+          status={quotaAwareChatGptStatus(snapshot)}
+          statusLabel={snapshot.aiQuotaExhausted ? '额度用尽' : undefined}
           icon={<SparkIcon />}
         >
           <div className="account-connect-block">
             <div className="account-graphic chatgpt-graphic"><SparkIcon /></div>
             <div className="account-copy">
-              <strong>{snapshot.connections.chatgpt.phase === 'connected' ? 'ChatGPT 已授权' : '使用 ChatGPT 账号登录'}</strong>
+              <strong>
+                {snapshot.aiQuotaExhausted
+                  ? 'ChatGPT 额度已用尽'
+                  : snapshot.connections.chatgpt.phase === 'connected'
+                    ? 'ChatGPT 已授权'
+                    : '使用 ChatGPT 账号登录'}
+              </strong>
               <p>
-                {snapshot.connections.chatgpt.phase === 'connected'
+                {snapshot.aiQuotaExhausted
+                  ? '当前无法分析或自动下单；Telegram 监听与频道消息接收仍会继续。'
+                  : snapshot.connections.chatgpt.phase === 'connected'
                   ? `当前模型：${snapshot.aiModel ?? '自动选择最快可用模型'}`
                   : '不会读取浏览器 Cookie；登录由官方授权页面完成。'}
               </p>
               {typeof snapshot.aiQuotaPercent === 'number' && (
-                <div className="quota-row">
+                <div className={`quota-row ${snapshot.aiQuotaExhausted ? 'exhausted' : ''}`}>
                   <div className="quota-track"><span style={{ width: `${Math.min(100, snapshot.aiQuotaPercent)}%` }} /></div>
-                  <small>本周期已用 {Math.round(snapshot.aiQuotaPercent)}%</small>
+                  <small>
+                    {snapshot.aiQuotaExhausted
+                      ? '额度已用尽'
+                      : `本周期已用 ${Math.round(snapshot.aiQuotaPercent)}%`}
+                  </small>
                 </div>
               )}
             </div>
@@ -1040,7 +1076,7 @@ function SettingsView({
                   可用下方“测试网络”查看当前出口，再自行决定是否加入 OKX API 白名单；未检查或未配置白名单不影响保存此处 API 配置。
                 </span>
               </div>
-              <small>{snapshot.diagnostics.directIp ? `最近检测 ${snapshot.diagnostics.directIp}` : '尚未检测'}</small>
+              <small>{presentNetworkDiagnostics(snapshot.diagnostics).directIpStatus}</small>
             </div>
             <div className="form-actions span-full">
               {snapshot.connections.okx.phase === 'connected' ? (
@@ -1187,13 +1223,7 @@ function SettingsView({
                 type="button"
                 className="button button-secondary"
                 disabled={Boolean(busyAction)}
-                onClick={() =>
-                  void runAction(
-                    'diagnostics',
-                    () => api?.runNetworkDiagnostics() ?? Promise.resolve({ ok: false }),
-                    '网络诊断已完成',
-                  )
-                }
+                onClick={() => void diagnoseNetwork()}
               >
                 {busyAction === 'diagnostics' ? <Spinner /> : <PulseIcon />}
                 可选：测试网络出口
@@ -1213,6 +1243,7 @@ function SettingsView({
 function SignalCard({ signal, newest }: { signal: SignalRecord; newest: boolean }): JSX.Element {
   const stage = STAGE_META[signal.stage]
   const decision = signal.analysis ? DECISION_META[signal.analysis.decision] : null
+  const awaitingTelegramRecovery = signal.stage === 'received' && signal.telegram.recovered === true
   const age = relativeTime(signal.telegram.receivedAt)
   const messageText = signal.telegram.text.trim() || '该消息没有正文内容'
 
@@ -1274,7 +1305,14 @@ function SignalCard({ signal, newest }: { signal: SignalRecord; newest: boolean 
         ) : (
           <div className="analysis-pending">
             <span className="thinking-orb"><SparkIcon /></span>
-            <div><strong>正在分析消息</strong><small>最长等待 10 秒，超时将自动跳过</small></div>
+            <div>
+              <strong>{awaitingTelegramRecovery ? '消息已立即显示' : '正在分析消息'}</strong>
+              <small>
+                {awaitingTelegramRecovery
+                  ? '正在校验 Telegram 断线补拉顺序，确认后再开始 AI 分析'
+                  : '最长等待 10 秒，超时将自动跳过'}
+              </small>
+            </div>
             <span className="loading-dots"><i /><i /><i /></span>
           </div>
         )}
@@ -1393,22 +1431,20 @@ function SafetyCard({ snapshot, latestSignal }: { snapshot: AppSnapshot; latestS
 }
 
 function DiagnosticsSummary({ diagnostics }: { diagnostics: NetworkDiagnostics }): JSX.Element {
-  const rows = [
-    { label: 'Clash Party', value: diagnostics.proxyReachable ? '可达' : '未验证', tone: diagnostics.proxyReachable ? 'ok' : '' },
-    { label: '代理协议', value: diagnostics.proxyProtocol?.toUpperCase() ?? 'AUTO', tone: diagnostics.proxyReachable ? 'ok' : '' },
-    { label: 'OKX 出口（可选）', value: diagnostics.okxDirect ? '端点可达' : '未验证', tone: diagnostics.okxDirect ? 'info' : 'optional' },
-  ]
+  const presentation = presentNetworkDiagnostics(diagnostics)
   return (
     <div className="diagnostics-summary">
-      {rows.map((row) => (
+      {presentation.rows.map((row) => (
         <div key={row.label}>
           <span className={row.tone} />
           <small>{row.label}</small>
           <strong>{row.value}</strong>
         </div>
       ))}
-      {(diagnostics.directIp || diagnostics.proxiedIp) && (
-        <p>直连 {diagnostics.directIp ?? '—'} · 代理 {diagnostics.proxiedIp ?? '—'}</p>
+      {presentation.checked && diagnostics.checkedAt !== undefined && (
+        <p title={diagnostics.detail}>
+          检测 {formatClock(diagnostics.checkedAt)} · {presentation.addressSummary}
+        </p>
       )}
     </div>
   )
@@ -1458,6 +1494,7 @@ function SettingsCard({
   title,
   subtitle,
   status,
+  statusLabel,
   icon,
   children,
 }: {
@@ -1465,6 +1502,7 @@ function SettingsCard({
   title: string
   subtitle: string
   status?: ConnectionStatus
+  statusLabel?: string
   icon: ReactNode
   children: ReactNode
 }): JSX.Element {
@@ -1477,7 +1515,7 @@ function SettingsCard({
           <h3>{title}</h3>
           <p>{subtitle}</p>
         </div>
-        {status && <ConnectionBadge status={status} />}
+        {status && <ConnectionBadge status={status} displayLabel={statusLabel} />}
       </div>
       <div className="settings-card-body">{children}</div>
     </section>
@@ -1506,18 +1544,38 @@ function Toggle({ label, description, checked, onChange }: { label: string; desc
   )
 }
 
-function ConnectionPill({ name, status, icon }: { name: string; status: ConnectionStatus; icon: ReactNode }): JSX.Element {
+function ConnectionPill({
+  name,
+  status,
+  displayLabel,
+  icon,
+}: {
+  name: string
+  status: ConnectionStatus
+  displayLabel?: string
+  icon: ReactNode
+}): JSX.Element {
   return (
     <div className={`connection-pill ${status.phase}`} title={status.detail}>
       <span className="connection-icon">{icon}</span>
-      <span className="connection-copy"><small>{name}</small><strong>{PHASE_LABELS[status.phase]}</strong></span>
+      <span className="connection-copy"><small>{name}</small><strong>{displayLabel ?? PHASE_LABELS[status.phase]}</strong></span>
       <span className="connection-dot" />
     </div>
   )
 }
 
-function ConnectionBadge({ status }: { status: ConnectionStatus }): JSX.Element {
-  return <span className={`connection-badge ${status.phase}`}><i />{PHASE_LABELS[status.phase]}</span>
+function ConnectionBadge({ status, displayLabel }: { status: ConnectionStatus; displayLabel?: string }): JSX.Element {
+  return <span className={`connection-badge ${status.phase}`}><i />{displayLabel ?? PHASE_LABELS[status.phase]}</span>
+}
+
+function quotaAwareChatGptStatus(snapshot: AppSnapshot): ConnectionStatus {
+  if (!snapshot.aiQuotaExhausted) return snapshot.connections.chatgpt
+  return {
+    ...snapshot.connections.chatgpt,
+    phase: 'error',
+    label: '额度用尽',
+    detail: '无法进行 AI 分析或自动下单；Telegram 监听与频道消息接收仍会继续',
+  }
 }
 
 function MetricCard({ label, value, subvalue, tone, icon }: { label: string; value: string; subvalue: string; tone: string; icon: ReactNode }): JSX.Element {

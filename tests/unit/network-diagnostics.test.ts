@@ -105,6 +105,7 @@ describe('NetworkDiagnosticsService', () => {
       directIp: '203.0.113.10',
       proxiedIp: '198.51.100.20',
       okxDirect: false,
+      checkedAt: expect.any(Number),
     })
     expect(result.detail).toBe(
       'Proxy reachable via SOCKS5; Optional warning: OKX direct check returned an invalid response',

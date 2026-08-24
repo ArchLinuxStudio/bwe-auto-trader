@@ -45,6 +45,7 @@ import {
   type OkxAccountVerification,
   type OkxClientOptions,
   type OkxInstrument,
+  type OkxMutationLifecycleEvent,
   type OkxOrder,
   type OkxOrderReconciliationResult,
   type OkxOrderUpdate,
@@ -53,6 +54,13 @@ import {
   type OkxPrivateStream,
   type OkxRouteSelection
 } from './services/okx'
+import {
+  MutationJournalConflictError,
+  MutationJournalStore,
+  createOkxAccountFingerprint,
+  type DurableMutationRecord,
+  type DurableMutationResolutionEvidence
+} from './services/mutation-journal'
 import { SecretStore } from './services/secret-store'
 import { SettingsStore } from './services/settings-store'
 import {
@@ -142,6 +150,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private readonly settingsStore: SettingsStore
   private readonly secretStore: SecretStore
   private readonly audit: AuditLog
+  private readonly mutationJournal: MutationJournalStore
   private readonly coordinator: SignalCoordinator
   private settings!: PublicSettings
   private telegram?: TelegramMonitor
@@ -152,8 +161,23 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private okxInstruments: OkxInstrument[] = []
   private readonly pendingPositionCloses = new Map<string, PendingPositionClose>()
   private readonly earlyCloseOrderUpdates: OkxOrderUpdate[] = []
+  private readonly earlyDurableOrderUpdates: OkxOrderUpdate[] = []
   private readonly finalizedCloseOrderKeys = new Set<string>()
   private readonly finalizedCloseOrderKeyOrder: string[] = []
+  private readonly finalizedDurableMutationIds = new Set<string>()
+  private readonly finalizedDurableMutationIdOrder: string[] = []
+  private readonly finalizedDurableOrderIdsByClient = new Map<string, string | undefined>()
+  private readonly finalizedDurableClientIdsByOrder = new Map<string, string>()
+  private readonly finalizedDurableMutationsPermittingOrderBinding = new Set<string>()
+  private readonly finalizedDurableInstrumentIdsByClient = new Map<string, string>()
+  private readonly finalizedDurableOperationsByClient = new Map<
+    string,
+    DurableMutationRecord['operation']
+  >()
+  private readonly startupDurableMutationIds = new Set<string>()
+  private durableMutations: DurableMutationRecord[] = []
+  private mutationJournalFailure?: string
+  private readonly okxAccountFingerprints = new WeakMap<OkxV5Client, string>()
   private positions: AppPosition[] = []
   private notifications: NotificationItem[] = []
   private pendingPrompt?: PendingPromptState
@@ -173,6 +197,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private armedAt?: number
   private aiModel?: string
   private aiQuotaPercent?: number
+  private aiQuotaExhausted = false
   private lastError?: string
   private initialized = false
   private closing = false
@@ -180,6 +205,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private activePositionClose?: Promise<void>
   private closeScopedArmedClient?: OkxV5Client
   private readonly okxLifecycleMutex = new AsyncLifecycleMutex()
+  private readonly mutationJournalLifecycleMutex = new AsyncLifecycleMutex()
   private okxLifecycleRevision = 0
   private okxCredentialExposureStatus: OkxCredentialExposureStatus = 'unverified'
   private readonly okxCredentialExposureFacts = new Set<string>()
@@ -203,6 +229,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.settingsStore = new SettingsStore(options.userDataDirectory)
     this.secretStore = new SecretStore(options.userDataDirectory)
     this.audit = new AuditLog(options.userDataDirectory)
+    this.mutationJournal = new MutationJournalStore(options.userDataDirectory)
     const initial = this.now()
     this.connections = {
       telegram: connection('not_configured', '未配置', initial),
@@ -319,6 +346,32 @@ export class AppController extends EventEmitter<ControllerEvents> {
   async initialize(): Promise<void> {
     if (this.initialized) return
     this.settings = await this.settingsStore.read()
+    let recoveredBeforeTransmission = 0
+    try {
+      this.durableMutations = await this.mutationJournal.read()
+      const startupRecords = new Map(
+        this.durableMutations.map((record) => [record.clOrdId, record] as const)
+      )
+      const recovery = await this.mutationJournal.resolvePreparedBeforeTransmission()
+      this.durableMutations = recovery.records
+      for (const record of recovery.records) {
+        this.startupDurableMutationIds.add(record.clOrdId)
+      }
+      recoveredBeforeTransmission = recovery.removedClientOrderIds.length
+      for (const clientOrderId of recovery.removedClientOrderIds) {
+        const record = startupRecords.get(clientOrderId)
+        this.rememberFinalizedDurableMutation(
+          clientOrderId,
+          undefined,
+          false,
+          record?.instId,
+          record?.operation
+        )
+      }
+    } catch {
+      this.mutationJournalFailure = '本地订单恢复日志无法验证，已禁止任何实盘 mutation'
+      this.lastError = this.mutationJournalFailure
+    }
     this.connections.telegram = connection(
       this.settings.telegramConfigured ? 'disconnected' : 'not_configured',
       this.settings.telegramConfigured ? '已配置，未连接' : '未配置',
@@ -334,7 +387,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
     await this.audit.write('application_started', 'info', {
       version: this.options.version,
       platform: process.platform,
-      liveArmed: false
+      liveArmed: false,
+      unresolvedMutationCount: this.durableMutations.length,
+      recoveredBeforeTransmission,
+      mutationJournalHealthy: !this.mutationJournalFailure
     })
     this.emitSnapshot()
   }
@@ -362,6 +418,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
       pendingAuthPrompt: this.pendingPrompt?.prompt,
       aiModel: this.aiModel,
       aiQuotaPercent: this.aiQuotaPercent,
+      aiQuotaExhausted: this.aiQuotaExhausted,
       lastError: this.lastError
     })
   }
@@ -411,6 +468,9 @@ export class AppController extends EventEmitter<ControllerEvents> {
       callbacks: {
         onStatus: (status) => this.handleTelegramStatus(status),
         onAuthRequired: (request) => this.createTelegramPrompt(request),
+        onMessageObserved: async (message) => {
+          await this.coordinator.observeRecovered(toTelegramMessagePayload(message))
+        },
         onMessage: async (message, context) => {
           await this.coordinator.process(
             toTelegramMessagePayload(message),
@@ -440,11 +500,15 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.setConnection('telegram', 'connected', `已连接并守候 @${monitor.channelUsername}`)
       await this.audit.write('telegram_connected', 'info', { channel: monitor.channelUsername })
     } catch (error) {
+      const disarm = this.disarmLiveTrading('Telegram 连接失败，已锁定实盘').catch(() => undefined)
       if (this.telegram === monitor) {
         this.telegram = undefined
         this.telegramLifecycleRevision += 1
+        await this.coordinator.finalizePendingRecoveryObservations(
+          'Telegram 连接失败，等待连续性校验的消息未进入 AI 分析'
+        ).catch(() => undefined)
       }
-      await this.disarmLiveTrading('Telegram 连接失败，已锁定实盘').catch(() => undefined)
+      await disarm
       this.setConnection('telegram', 'error', errorText(error))
       await this.notify('error', 'Telegram 连接失败', errorText(error))
     }
@@ -533,6 +597,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.settings = await this.settingsStore.setFlags({ chatgptConfigured: false })
     this.aiModel = undefined
     this.aiQuotaPercent = undefined
+    this.aiQuotaExhausted = false
     this.setConnection('chatgpt', 'disconnected', '已退出 ChatGPT')
   }
 
@@ -581,6 +646,15 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.earlyCloseOrderUpdates.length = 0
       this.finalizedCloseOrderKeys.clear()
       this.finalizedCloseOrderKeyOrder.length = 0
+      this.earlyDurableOrderUpdates.length = 0
+      this.finalizedDurableMutationIds.clear()
+      this.finalizedDurableMutationIdOrder.length = 0
+      this.finalizedDurableOrderIdsByClient.clear()
+      this.finalizedDurableClientIdsByOrder.clear()
+      this.finalizedDurableMutationsPermittingOrderBinding.clear()
+      this.finalizedDurableInstrumentIdsByClient.clear()
+      this.finalizedDurableOperationsByClient.clear()
+      this.startupDurableMutationIds.clear()
     }
 
     await this.secretStore.set(OKX_CREDENTIALS_KEY, JSON.stringify(input))
@@ -598,20 +672,33 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   private async connectOkxUnlocked(): Promise<void> {
+    if (this.mutationJournalFailure) throw new Error(this.mutationJournalFailure)
     const credentials = await this.readJsonSecret<OkxCredentialsInput>(OKX_CREDENTIALS_KEY)
     if (!credentials) throw new Error('请先保存 OKX 子账户 API 凭据')
     await this.disconnectOkxUnlocked()
     this.setConnection('okx', 'connecting', '正在连接 OKX 并校验子账户')
-    const client = (this.options.createOkxClient ?? ((options) => new OkxV5Client(options)))({
+    let client!: OkxV5Client
+    client = (this.options.createOkxClient ?? ((options) => new OkxV5Client(options)))({
       credentials,
-      proxy: this.settings.proxy
+      proxy: this.settings.proxy,
+      onMutationLifecycle: (event) => this.handleOkxMutationLifecycle(client, event)
     })
     this.okx = client
     try {
-      const verification = await client.verifyAccountConfiguration()
+      let verification = await client.verifyAccountConfiguration()
       this.rememberOkxVerificationExposure(verification)
       this.captureOkxRoutes(client)
       await this.auditOkxRoute('rest', this.okxRoutes.rest)
+      const accountFingerprint = createOkxAccountFingerprint(verification.config.uid)
+      this.okxAccountFingerprints.set(client, accountFingerprint)
+      const hadRecoveredMutations = this.durableMutations.length > 0
+      await this.recoverDurableMutations(client, verification, accountFingerprint)
+      if (hadRecoveredMutations && this.durableMutations.length === 0) {
+        // Recovery may have consumed a terminal order that appeared pending in
+        // the first snapshot. Re-run the complete fail-closed exposure check.
+        verification = await client.verifyAccountConfiguration()
+        this.rememberOkxVerificationExposure(verification)
+      }
       if (!verification.ok) throw new Error(verification.errors.join('；'))
       client.setLiveTradingArmed(false)
       const [instruments] = await Promise.all([
@@ -792,6 +879,9 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.monitoringRevision += 1
       this.emergencyStopped = priorEmergencyStopped
       this.invalidateOkxOpeningCapability()
+      await this.coordinator.finalizePendingRecoveryObservations(
+        '监听启动已回滚，等待连续性校验的消息未进入 AI 分析'
+      ).catch(() => undefined)
       this.emitSnapshot()
       await this.audit.write('monitoring_start_rolled_back', 'warning', {
         error: errorText(error)
@@ -804,7 +894,14 @@ export class AppController extends EventEmitter<ControllerEvents> {
     const wasMonitoring = this.monitoring
     this.monitoringRevision += 1
     this.monitoring = false
-    await this.disarmLiveTrading()
+    // Calling the async method starts its synchronous capability revocation
+    // before any observation/UI cleanup is allowed to yield.
+    const disarm = this.disarmLiveTrading()
+    void disarm.catch(() => undefined)
+    await this.coordinator.finalizePendingRecoveryObservations(
+      `${reason}，等待连续性校验的消息未进入 AI 分析`
+    ).catch(() => undefined)
+    await disarm
     if (wasMonitoring) {
       await this.audit.write('monitoring_stopped', 'warning', { reason })
       await this.notify('info', '监听已停止', reason)
@@ -817,6 +914,8 @@ export class AppController extends EventEmitter<ControllerEvents> {
     if (this.activePositionClose || this.pendingPositionCloses.size > 0) {
       throw new Error('平仓操作仍在提交或等待最终状态，不能解锁实盘')
     }
+    const durableBlockers = this.mutationJournalBlockers()
+    if (durableBlockers.length > 0) throw new Error(durableBlockers.join('；'))
     const lifecycleRevision = this.okxLifecycleRevision
     const telegramMonitor = this.telegram
     const telegramRevision = telegramMonitor?.liveTradingReadiness.revision
@@ -904,7 +1003,12 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.monitoringRevision += 1
     this.monitoring = false
     this.emergencyStopped = true
-    await this.disarmLiveTrading()
+    const disarm = this.disarmLiveTrading()
+    void disarm.catch(() => undefined)
+    await this.coordinator.finalizePendingRecoveryObservations(
+      '已紧急停止，等待连续性校验的消息未进入 AI 分析'
+    ).catch(() => undefined)
+    await disarm
     await this.audit.write('emergency_stop', 'critical', {
       openPositions: this.positions.map((position) => position.instrumentId)
     })
@@ -914,6 +1018,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   async closePosition(input: ClosePositionInput): Promise<void> {
     if (this.activePositionClose) throw new Error('已有平仓操作正在提交，请等待其最终状态')
+    const durableBlockers = this.mutationJournalBlockers()
+    if (durableBlockers.length > 0) {
+      throw new Error(`当前不能提交新的平仓 mutation：${durableBlockers.join('；')}`)
+    }
 
     // A close request is a risk-reduction boundary. Invalidate every old
     // opening capability synchronously, before validation, position refresh,
@@ -1126,6 +1234,9 @@ export class AppController extends EventEmitter<ControllerEvents> {
     const client = this.okx
     const stream = this.okxStream
     await this.telegram?.stop().catch(() => undefined)
+    await this.coordinator.finalizePendingRecoveryObservations(
+      '应用已关闭，等待连续性校验的消息未进入 AI 分析'
+    ).catch(() => undefined)
     if (this.telegram) {
       this.telegram = undefined
       this.telegramLifecycleRevision += 1
@@ -1215,16 +1326,27 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   private handleChatGptStatus(status: ReturnType<ChatGptService['getStatus']>): void {
+    const wasQuotaExhausted = this.aiQuotaExhausted
     this.aiModel = status.selectedModel ?? undefined
-    this.aiQuotaPercent = rateLimitUsedPercent(status.rateLimits)
-    const ready = status.authenticated && status.warmedUp && !status.lastError
-    if (!ready) {
+    this.aiQuotaExhausted = status.quotaExhausted
+    this.aiQuotaPercent = status.quotaExhausted ? 100 : rateLimitUsedPercent(status.rateLimits)
+    const serviceReady = status.authenticated && status.warmedUp && !status.lastError
+    const analysisReady = serviceReady && !status.quotaExhausted
+    if (!analysisReady) {
       void this.disarmLiveTrading(
-        'ChatGPT 分析服务已离开就绪状态，已锁定实盘；恢复后需人工重新确认'
+        status.quotaExhausted
+          ? 'ChatGPT 额度已用尽，已锁定实盘；Telegram 监听继续运行，额度恢复后需人工重新确认实盘'
+          : 'ChatGPT 分析服务已离开就绪状态，已锁定实盘；恢复后需人工重新确认'
       ).catch(() => undefined)
     }
-    if (ready) {
-      this.setConnection('chatgpt', 'connected', `已预热 ${status.selectedModel ?? '快速模型'}${status.busy ? ' · 分析中' : ''}`)
+    if (serviceReady) {
+      this.setConnection(
+        'chatgpt',
+        'connected',
+        status.quotaExhausted
+          ? '额度已用尽：无法进行 AI 分析或自动下单；Telegram 监听仍在运行'
+          : `已预热 ${status.selectedModel ?? '快速模型'}${status.busy ? ' · 分析中' : ''}`
+      )
     } else if (status.lastError) {
       this.setConnection('chatgpt', 'error', status.lastError)
     } else if (status.authenticated || status.initialized) {
@@ -1233,6 +1355,16 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.setConnection('chatgpt', 'disconnected', 'ChatGPT 服务未就绪')
     }
     if (status.lastError) this.lastError = status.lastError
+    if (status.quotaExhausted && !wasQuotaExhausted) {
+      void this.audit.write('chatgpt_quota_exhausted', 'warning', {
+        monitoringContinues: this.monitoring
+      }).catch(() => undefined)
+      void this.notify(
+        'warning',
+        'ChatGPT 额度已用尽',
+        '当前无法进行 AI 分析或自动下单；Telegram 监听与频道消息接收将继续'
+      ).catch(() => undefined)
+    }
     this.emitSnapshot()
   }
 
@@ -1242,6 +1374,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     const service = this.chatgpt
     this.chatgpt = undefined
     if (service) await service.close().catch(() => undefined)
+    this.aiQuotaExhausted = false
   }
 
   private createTelegramPrompt(request: TelegramAuthRequest): void {
@@ -1274,6 +1407,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   private async handleOkxOrders(orders: OkxOrderUpdate[]): Promise<void> {
     for (const order of orders) {
+      await this.persistDurableOrderEvidence(order)
       await this.coordinator.handleOrderUpdate({
         clientOrderId: order.clOrdId,
         orderId: order.ordId,
@@ -1316,6 +1450,12 @@ export class AppController extends EventEmitter<ControllerEvents> {
         pending.state !== 'submitting' &&
         pending.state !== 'unknown'
       ) {
+        if (pending.clientOrderId) {
+          await this.resolveDurableMutation(
+            pending.clientOrderId,
+            'same_origin_position_effect'
+          )
+        }
         this.pendingPositionCloses.delete(instrumentId)
         this.rememberFinalizedClose(pending)
         confirmedCloses.push(pending)
@@ -1492,8 +1632,13 @@ export class AppController extends EventEmitter<ControllerEvents> {
         const pendingMatch = findTrackedOkxOrder(pendingOrders, trackedSignal)
         const order = pendingMatch ?? await this.queryTrackedOrder(client, trackedSignal)
         if (order) {
+          await this.persistDurableOrderEvidence(order)
           await this.coordinator.handleOrderUpdate(toSignalOrderUpdate(order))
         } else if (hasOpenOkxPosition(rawPositions, pendingSignal.instrumentId)) {
+          await this.resolveDurableMutation(
+            pendingSignal.clientOrderId,
+            'same_origin_position_effect'
+          )
           await this.coordinator.confirmPendingOrderFromPosition({
             clientOrderId: pendingSignal.clientOrderId,
             instrumentId: pendingSignal.instrumentId
@@ -1504,7 +1649,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
       for (const pending of pendingCloses) {
         const pendingMatch = findTrackedOkxOrder(pendingOrders, pending)
         const order = pendingMatch ?? await this.queryTrackedOrder(client, pending)
-        if (order) await this.handlePendingCloseOrderUpdate(order)
+        if (order) {
+          await this.persistDurableOrderEvidence(order)
+          await this.handlePendingCloseOrderUpdate(order)
+        }
       }
 
       if (this.okx !== client) return
@@ -1601,6 +1749,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
             return
           }
           if (result.order) {
+            await this.persistDurableOrderEvidence(result.order)
             if (isClose) await this.handlePendingCloseOrderUpdate(result.order)
             else await this.coordinator.handleOrderUpdate(toSignalOrderUpdate(result.order))
           } else {
@@ -1644,6 +1793,16 @@ export class AppController extends EventEmitter<ControllerEvents> {
       throw new Error('拒绝根据单次未找到结果释放未知订单互锁')
     }
     const hasPosition = hasOpenOkxPosition(result.positions, error.instId)
+    await this.resolveDurableMutation(
+      error.clOrdId,
+      error.operation === 'open'
+        ? hasPosition
+          ? 'same_origin_position_effect'
+          : 'same_origin_absence_window'
+        : hasPosition
+          ? 'same_origin_absence_window'
+          : 'same_origin_position_effect'
+    )
     if (error.operation === 'open') {
       if (hasPosition) {
         await this.coordinator.confirmPendingOrderFromPosition({
@@ -1692,6 +1851,528 @@ export class AppController extends EventEmitter<ControllerEvents> {
     }
   }
 
+  private async handleOkxMutationLifecycle(
+    client: OkxV5Client,
+    event: Readonly<OkxMutationLifecycleEvent>
+  ): Promise<void> {
+    return this.mutationJournalLifecycleMutex.runExclusive(
+      () => this.handleOkxMutationLifecycleUnlocked(client, event)
+    )
+  }
+
+  private async handleOkxMutationLifecycleUnlocked(
+    client: OkxV5Client,
+    event: Readonly<OkxMutationLifecycleEvent>
+  ): Promise<void> {
+    const accountFingerprint = this.okxAccountFingerprints.get(client)
+    if (!accountFingerprint) {
+      this.invalidateOkxOpeningCapability()
+      throw new Error('OKX 账户缺少持久化订单恢复身份，已在发送前阻止 mutation')
+    }
+    try {
+      if (event.phase === 'prepared') {
+        if (this.finalizedDurableMutationIds.has(event.clOrdId)) {
+          throw new Error('OKX 重用了本进程已终态的客户订单号')
+        }
+        this.durableMutations = await this.mutationJournal.begin({
+          operation: event.operation,
+          accountFingerprint,
+          instId: event.instId,
+          clOrdId: event.clOrdId,
+          createdAt: event.createdAt,
+          intentExpiresAt: event.intentExpiresAt
+        })
+        return
+      }
+      if (this.finalizedDurableMutationIds.has(event.clOrdId)) {
+        if (
+          this.finalizedDurableInstrumentIdsByClient.get(event.clOrdId) !== event.instId ||
+          this.finalizedDurableOperationsByClient.get(event.clOrdId) !== event.operation
+        ) {
+          throw new Error('OKX late lifecycle 与已终态订单身份冲突')
+        }
+        if (
+          event.phase === 'accepted' &&
+          (
+            !event.ordId ||
+            this.finalizedDurableOrderIdsByClient.get(event.clOrdId) !== event.ordId
+          )
+        ) {
+          throw new Error('OKX late ACK 与已终态订单的交易所订单号冲突')
+        }
+        return
+      }
+      const lifecycleRecord = this.durableMutations.find(
+        (record) => record.clOrdId === event.clOrdId
+      )
+      if (
+        lifecycleRecord &&
+        (
+          lifecycleRecord.operation !== event.operation ||
+          lifecycleRecord.instId !== event.instId ||
+          lifecycleRecord.createdAt !== event.createdAt ||
+          lifecycleRecord.intentExpiresAt !== event.intentExpiresAt
+        )
+      ) {
+        throw new Error('OKX mutation lifecycle 与持久化订单身份不一致')
+      }
+      if (event.phase === 'transmitting') {
+        if (event.exchangeExpiresAt === undefined) {
+          throw new Error('OKX mutation 缺少 exchange expTime 证据')
+        }
+        this.durableMutations = await this.mutationJournal.markTransmissionStarted({
+          clOrdId: event.clOrdId,
+          updatedAt: event.updatedAt,
+          exchangeExpiresAt: event.exchangeExpiresAt
+        })
+        return
+      }
+      if (event.phase === 'accepted') {
+        if (!event.ordId) throw new Error('OKX mutation ACK 缺少 ordId')
+        this.durableMutations = await this.mutationJournal.markAccepted({
+          clOrdId: event.clOrdId,
+          ordId: event.ordId,
+          updatedAt: event.updatedAt
+        })
+        if (await this.resolveObservedTerminalMutationUnlocked(event.clOrdId)) return
+        await this.replayEarlyDurableOrderUpdatesUnlocked(event.clOrdId, event.ordId)
+        return
+      }
+      if (event.phase === 'unknown') {
+        this.durableMutations = await this.mutationJournal.markUnknown({
+          clOrdId: event.clOrdId,
+          updatedAt: event.updatedAt
+        })
+        await this.resolveObservedTerminalMutationUnlocked(event.clOrdId)
+        return
+      }
+      if (!event.terminalEvidence) {
+        throw new Error('OKX terminal mutation 事件缺少终态证据')
+      }
+      const terminalRecord = this.durableMutations.find(
+        (record) => record.clOrdId === event.clOrdId
+      )
+      if (
+        ['not_transmitted', 'rejected'].includes(event.terminalEvidence) &&
+        terminalRecord &&
+        (
+          terminalRecord.ordId !== undefined ||
+          terminalRecord.reconciliationState !== 'not_started'
+        )
+      ) {
+        throw new Error('OKX mutation 拒绝结果与已观察到的订单证据冲突')
+      }
+      const resolution = await this.mutationJournal.resolve(
+        event.clOrdId,
+        event.terminalEvidence === 'not_transmitted'
+          ? 'not_transmitted'
+          : 'terminal_order'
+      )
+      this.durableMutations = resolution.records
+      if (resolution.removed) {
+        this.rememberFinalizedDurableMutation(
+          event.clOrdId,
+          terminalRecord?.ordId,
+          false,
+          terminalRecord?.instId ?? event.instId,
+          terminalRecord?.operation ?? event.operation
+        )
+      }
+    } catch (error) {
+      this.invalidateOkxOpeningCapability()
+      if (error instanceof MutationJournalConflictError) {
+        this.emitSnapshotSafely()
+        throw new Error(error.message)
+      }
+      this.failMutationJournal()
+      throw new Error('本地订单恢复日志写入失败，已锁定全部实盘 mutation')
+    }
+  }
+
+  private async persistDurableOrderEvidence(
+    order: OkxOrderUpdate,
+    source: 'runtime' | 'startup_recovery' = 'runtime'
+  ): Promise<void> {
+    return this.mutationJournalLifecycleMutex.runExclusive(
+      () => this.persistDurableOrderEvidenceUnlocked(order, source)
+    )
+  }
+
+  private async persistDurableOrderEvidenceUnlocked(
+    order: OkxOrderUpdate,
+    source: 'runtime' | 'startup_recovery' = 'runtime'
+  ): Promise<void> {
+    const clientOrderId = cleanOkxValue(order.clOrdId)
+    const orderId = cleanOkxValue(order.ordId)
+    if (clientOrderId && this.finalizedDurableMutationIds.has(clientOrderId)) {
+      if (
+        order.instType !== 'SWAP' ||
+        this.finalizedDurableInstrumentIdsByClient.get(clientOrderId) !== order.instId
+      ) {
+        this.failMutationJournal()
+        throw new Error('OKX late 订单证据与已终态合约身份冲突')
+      }
+      const finalizedOrderId = this.finalizedDurableOrderIdsByClient.get(clientOrderId)
+      if (
+        finalizedOrderId === undefined &&
+        this.finalizedDurableMutationsPermittingOrderBinding.has(clientOrderId) &&
+        orderId !== undefined
+      ) {
+        const finalizedClientOrderId = this.finalizedDurableClientIdsByOrder.get(orderId)
+        if (
+          finalizedClientOrderId !== undefined &&
+          finalizedClientOrderId !== clientOrderId
+        ) {
+          this.failMutationJournal()
+          throw new Error('OKX late 订单证据与已终态客户订单号冲突')
+        }
+        this.rememberFinalizedDurableMutation(clientOrderId, orderId, true)
+        return
+      }
+      if (finalizedOrderId === undefined || finalizedOrderId !== orderId) {
+        this.failMutationJournal()
+        throw new Error('OKX late 订单证据与已终态交易所订单号冲突')
+      }
+      return
+    }
+    if (orderId && this.finalizedDurableMutationIds.has(`order:${orderId}`)) {
+      const finalizedClientOrderId = this.finalizedDurableClientIdsByOrder.get(orderId)
+      if (
+        clientOrderId !== undefined &&
+        finalizedClientOrderId !== undefined &&
+        finalizedClientOrderId !== clientOrderId
+      ) {
+        this.failMutationJournal()
+        throw new Error('OKX late 订单证据与已终态客户订单号冲突')
+      }
+      if (
+        order.instType !== 'SWAP' ||
+        finalizedClientOrderId === undefined ||
+        this.finalizedDurableInstrumentIdsByClient.get(finalizedClientOrderId) !== order.instId
+      ) {
+        this.failMutationJournal()
+        throw new Error('OKX late 订单证据与已终态合约身份冲突')
+      }
+      return
+    }
+    const record = this.durableMutations.find(
+      (candidate) =>
+        (clientOrderId && candidate.clOrdId === clientOrderId) ||
+        (orderId && candidate.ordId === orderId)
+    )
+    if (!record) {
+      if (clientOrderId || orderId) this.bufferEarlyDurableOrderUpdate(order)
+      return
+    }
+    if (order.instType !== 'SWAP' || order.instId !== record.instId) {
+      this.failMutationJournal()
+      throw new Error('OKX 订单证据与持久化合约不一致')
+    }
+    if (clientOrderId && clientOrderId !== record.clOrdId) {
+      this.failMutationJournal()
+      throw new Error('OKX 订单证据与持久化客户订单号不一致')
+    }
+    if (!orderId || (record.ordId !== undefined && orderId !== record.ordId)) {
+      this.failMutationJournal()
+      throw new Error('OKX 订单证据与持久化交易所订单号不一致')
+    }
+    const state = normalizeOkxOrderState(order.state)
+    if (!state) {
+      this.failMutationJournal()
+      throw new Error('OKX 订单证据缺少可验证状态')
+    }
+    try {
+      if (TERMINAL_OKX_ORDER_STATES.has(state)) {
+        if (record.lifecycleState === 'prepared') {
+          throw new Error('OKX 订单证据在 transmission commit 前出现')
+        }
+        if (
+          record.ordId === undefined &&
+          record.lifecycleState === 'transmitting' &&
+          !(
+            source === 'startup_recovery' &&
+            this.startupDurableMutationIds.has(record.clOrdId)
+          )
+        ) {
+          this.durableMutations = await this.mutationJournal.markOrderObserved({
+            clOrdId: record.clOrdId,
+            ordId: orderId,
+            orderState: state,
+            pending: false,
+            updatedAt: this.now()
+          })
+          return
+        }
+        const resolution = await this.mutationJournal.resolve(
+          record.clOrdId,
+          'terminal_order'
+        )
+        this.durableMutations = resolution.records
+        if (resolution.removed) {
+          this.rememberFinalizedDurableMutation(
+            record.clOrdId,
+            orderId,
+            false,
+            record.instId,
+            record.operation
+          )
+        }
+        return
+      }
+      this.durableMutations = await this.mutationJournal.markOrderObserved({
+        clOrdId: record.clOrdId,
+        ordId: orderId,
+        orderState: state,
+        pending: state === 'live' || state === 'partially_filled',
+        updatedAt: this.now()
+      })
+    } catch (error) {
+      if (error instanceof MutationJournalConflictError) {
+        if (this.finalizedDurableMutationIds.has(record.clOrdId)) return
+      }
+      this.failMutationJournal()
+      throw new Error('OKX 订单证据无法原子写入恢复日志')
+    }
+  }
+
+  private async resolveDurableMutation(
+    clientOrderId: string,
+    evidence: DurableMutationResolutionEvidence
+  ): Promise<void> {
+    return this.mutationJournalLifecycleMutex.runExclusive(
+      () => this.resolveDurableMutationUnlocked(clientOrderId, evidence)
+    )
+  }
+
+  private async resolveDurableMutationUnlocked(
+    clientOrderId: string,
+    evidence: DurableMutationResolutionEvidence
+  ): Promise<void> {
+    const record = this.durableMutations.find(
+      (candidate) => candidate.clOrdId === clientOrderId
+    )
+    if (!record) return
+    try {
+      const resolution = await this.mutationJournal.resolve(clientOrderId, evidence)
+      this.durableMutations = resolution.records
+      if (resolution.removed) {
+        this.rememberFinalizedDurableMutation(
+          clientOrderId,
+          record.ordId,
+          record.ordId === undefined && evidence === 'same_origin_position_effect',
+          record.instId,
+          record.operation
+        )
+      }
+    } catch {
+      this.failMutationJournal()
+      throw new Error('订单终态证据无法原子提交，互锁保持生效')
+    }
+  }
+
+  private async recoverDurableMutations(
+    client: OkxV5Client,
+    verification: OkxAccountVerification,
+    accountFingerprint: string
+  ): Promise<void> {
+    if (this.durableMutations.length === 0) return
+    if (
+      this.durableMutations.some(
+        (record) => record.accountFingerprint !== accountFingerprint
+      )
+    ) {
+      throw new Error('当前 OKX 子账户与持久化未决订单不匹配，恢复日志保持锁定')
+    }
+
+    for (const record of [...this.durableMutations]) {
+      const pendingMatch = verification.pendingSwapOrders.find(
+        (order) => order.instId === record.instId && order.clOrdId === record.clOrdId
+      )
+      const order = pendingMatch ?? await this.queryRecoveredMutationOrder(client, record)
+      const positions = await client.getPositions(record.instId)
+      const positionEffectObserved = record.operation === 'open'
+        ? hasOpenOkxPosition(positions, record.instId)
+        : !hasOpenOkxPosition(positions, record.instId)
+
+      if (order) {
+        if (
+          order.instId !== record.instId ||
+          order.clOrdId !== record.clOrdId ||
+          (record.ordId !== undefined && order.ordId !== record.ordId)
+        ) {
+          throw new Error('OKX 返回的恢复订单身份与 journal 不一致')
+        }
+        await this.persistDurableOrderEvidence(order, 'startup_recovery')
+      } else {
+        await this.markDurableRecoveryNotFound(record.clOrdId, positionEffectObserved)
+      }
+
+      await this.audit.write('durable_mutation_read_only_recovery', 'warning', {
+        operation: record.operation,
+        instrumentId: record.instId,
+        clientOrderId: record.clOrdId,
+        matchedOrder: Boolean(order),
+        orderState: order?.state,
+        positionEffectObserved,
+        remainsLocked: this.durableMutations.some(
+          (candidate) => candidate.clOrdId === record.clOrdId
+        )
+      }).catch(() => undefined)
+    }
+
+    if (this.durableMutations.length > 0) {
+      throw new Error(
+        `仍有 ${this.durableMutations.length} 笔持久化订单未取得终态；新 client 的未找到结果不会自动解除互锁`
+      )
+    }
+  }
+
+  private async queryRecoveredMutationOrder(
+    client: OkxV5Client,
+    record: DurableMutationRecord
+  ): Promise<OkxOrder | undefined> {
+    try {
+      return await client.getOrder({
+        instId: record.instId,
+        clOrdId: record.clOrdId
+      })
+    } catch (error) {
+      if (error instanceof OkxApiError && ['51603', '51400'].includes(error.code)) {
+        return undefined
+      }
+      throw error
+    }
+  }
+
+  private rememberFinalizedDurableMutation(
+    clientOrderId: string,
+    orderId?: string,
+    permitsLateOrderBinding = false,
+    instrumentId?: string,
+    operation?: DurableMutationRecord['operation']
+  ): void {
+    if (instrumentId !== undefined) {
+      this.finalizedDurableInstrumentIdsByClient.set(clientOrderId, instrumentId)
+    }
+    if (operation !== undefined) {
+      this.finalizedDurableOperationsByClient.set(clientOrderId, operation)
+    }
+    if (!this.finalizedDurableOrderIdsByClient.has(clientOrderId)) {
+      this.finalizedDurableOrderIdsByClient.set(clientOrderId, orderId)
+    } else if (
+      orderId !== undefined &&
+      this.finalizedDurableOrderIdsByClient.get(clientOrderId) === undefined
+    ) {
+      this.finalizedDurableOrderIdsByClient.set(clientOrderId, orderId)
+    }
+    if (orderId !== undefined) {
+      this.finalizedDurableClientIdsByOrder.set(orderId, clientOrderId)
+      this.finalizedDurableMutationsPermittingOrderBinding.delete(clientOrderId)
+    } else if (permitsLateOrderBinding) {
+      this.finalizedDurableMutationsPermittingOrderBinding.add(clientOrderId)
+    }
+    for (const key of [clientOrderId, orderId ? `order:${orderId}` : undefined]) {
+      if (!key || this.finalizedDurableMutationIds.has(key)) continue
+      this.finalizedDurableMutationIds.add(key)
+      this.finalizedDurableMutationIdOrder.push(key)
+    }
+    while (this.finalizedDurableMutationIdOrder.length > FINALIZED_CLOSE_ORDER_KEY_LIMIT) {
+      const oldest = this.finalizedDurableMutationIdOrder.shift()
+      if (oldest) {
+        this.finalizedDurableMutationIds.delete(oldest)
+        if (oldest.startsWith('order:')) {
+          this.finalizedDurableClientIdsByOrder.delete(oldest.slice('order:'.length))
+        } else {
+          this.finalizedDurableOrderIdsByClient.delete(oldest)
+          this.finalizedDurableMutationsPermittingOrderBinding.delete(oldest)
+          this.finalizedDurableInstrumentIdsByClient.delete(oldest)
+          this.finalizedDurableOperationsByClient.delete(oldest)
+        }
+      }
+    }
+  }
+
+  private async markDurableRecoveryNotFound(
+    clientOrderId: string,
+    positionEffectObserved: boolean
+  ): Promise<void> {
+    return this.mutationJournalLifecycleMutex.runExclusive(async () => {
+      if (!this.durableMutations.some((record) => record.clOrdId === clientOrderId)) return
+      try {
+        this.durableMutations = await this.mutationJournal.markRecoveryNotFound({
+          clOrdId: clientOrderId,
+          updatedAt: this.now(),
+          positionEffectObserved
+        })
+      } catch {
+        this.failMutationJournal()
+        throw new Error('启动订单恢复证据无法写入 journal')
+      }
+    })
+  }
+
+  private async resolveObservedTerminalMutationUnlocked(clientOrderId: string): Promise<boolean> {
+    const record = this.durableMutations.find(
+      (candidate) => candidate.clOrdId === clientOrderId
+    )
+    if (!record?.lastOrderState || !TERMINAL_OKX_ORDER_STATES.has(record.lastOrderState)) {
+      return false
+    }
+    const resolution = await this.mutationJournal.resolve(clientOrderId, 'terminal_order')
+    this.durableMutations = resolution.records
+    if (resolution.removed) {
+      this.rememberFinalizedDurableMutation(
+        clientOrderId,
+        record.ordId,
+        false,
+        record.instId,
+        record.operation
+      )
+    }
+    return resolution.removed
+  }
+
+  private bufferEarlyDurableOrderUpdate(order: OkxOrderUpdate): void {
+    this.earlyDurableOrderUpdates.push(structuredClone(order))
+    while (this.earlyDurableOrderUpdates.length > EARLY_CLOSE_ORDER_UPDATE_LIMIT) {
+      this.earlyDurableOrderUpdates.shift()
+    }
+  }
+
+  private async replayEarlyDurableOrderUpdatesUnlocked(
+    clientOrderId: string,
+    orderId: string
+  ): Promise<void> {
+    const matches: OkxOrderUpdate[] = []
+    for (let index = this.earlyDurableOrderUpdates.length - 1; index >= 0; index -= 1) {
+      const update = this.earlyDurableOrderUpdates[index]!
+      if (cleanOkxValue(update.clOrdId) === clientOrderId || cleanOkxValue(update.ordId) === orderId) {
+        matches.unshift(update)
+        this.earlyDurableOrderUpdates.splice(index, 1)
+      }
+    }
+    for (const update of matches) await this.persistDurableOrderEvidenceUnlocked(update)
+  }
+
+  private failMutationJournal(): void {
+    this.mutationJournalFailure ??= '本地订单恢复日志不可用，已禁止任何实盘 mutation'
+    this.lastError = this.mutationJournalFailure
+    this.invalidateOkxOpeningCapability()
+    this.emitSnapshotSafely()
+    void this.audit.write('mutation_journal_failed_closed', 'critical', {
+      unresolvedMutationCount: this.durableMutations.length
+    }).catch(() => undefined)
+  }
+
+  private emitSnapshotSafely(): void {
+    if (!this.initialized) return
+    try {
+      this.emitSnapshot()
+    } catch {
+      // The main-process interlock above is authoritative even if a listener fails.
+    }
+  }
+
   private reserveOkxLifecycleChange(): void {
     this.okxLifecycleRevision += 1
     this.invalidateOkxOpeningCapability()
@@ -1704,6 +2385,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
       !this.monitoring ||
       !this.liveArmed ||
       !this.liveArmCapability ||
+      this.aiQuotaExhausted ||
       !telegramMonitor ||
       !telegramReadiness?.ready
     ) {
@@ -1760,6 +2442,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
       facts.push(`旧账户有 ${this.pendingPositionCloses.size} 个平仓订单等待最终状态或只读对账`)
     }
     if (this.okx?.requiresOrderReconciliation) facts.push('旧账户有结果未知订单等待只读对账')
+    if (this.durableMutations.length > 0) {
+      facts.push(`旧账户有 ${this.durableMutations.length} 笔持久化订单等待只读对账`)
+    }
+    if (this.mutationJournalFailure) facts.push('本地订单恢复日志无法验证')
     this.rememberOkxExposureFacts(facts)
   }
 
@@ -1889,6 +2575,8 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   private armBlockers(): string[] {
     const blockers = this.connectionBlockers()
+    blockers.push(...this.mutationJournalBlockers())
+    if (this.aiQuotaExhausted) blockers.push('ChatGPT 额度已用尽，当前无法分析或下单')
     if (this.telegram && !this.telegram.liveTradingReadiness.ready) {
       blockers.push('Telegram 正在校验断线补拉')
     }
@@ -1906,11 +2594,20 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   private okxCredentialChangeBlockers(): string[] {
-    const blockers: string[] = []
+    const blockers: string[] = [...this.mutationJournalBlockers()]
     if (this.coordinator.hasPendingOrder) blockers.push('开仓订单仍在等待最终状态或只读对账')
     if (this.activePositionClose) blockers.push('平仓操作正在提交，请等待其完成')
     if (this.pendingPositionCloses.size > 0) blockers.push('平仓订单仍在等待最终状态或只读对账')
     if (this.okx?.requiresOrderReconciliation) blockers.push('OKX 存在结果未知订单，必须先完成只读对账')
+    return blockers
+  }
+
+  private mutationJournalBlockers(): string[] {
+    const blockers: string[] = []
+    if (this.mutationJournalFailure) blockers.push(this.mutationJournalFailure)
+    if (this.durableMutations.length > 0) {
+      blockers.push(`有 ${this.durableMutations.length} 笔重启前订单 mutation 等待只读对账`)
+    }
     return blockers
   }
 
@@ -2185,21 +2882,24 @@ function rateLimitUsedPercent(value: ChatGptRateLimits | null): number | undefin
   if (!value) return undefined
   const queue: unknown[] = [value]
   const visited = new Set<unknown>()
+  let maximumUsedPercent: number | undefined
   while (queue.length) {
     const current = queue.shift()
     if (!current || typeof current !== 'object' || visited.has(current)) continue
     visited.add(current)
     for (const [key, child] of Object.entries(current)) {
       if (/^(usedPercent|percentUsed)$/i.test(key) && typeof child === 'number' && Number.isFinite(child)) {
-        return Math.max(0, Math.min(100, child))
+        const usedPercent = Math.max(0, Math.min(100, child))
+        maximumUsedPercent = Math.max(maximumUsedPercent ?? 0, usedPercent)
       }
       if (/^(remainingPercent|percentRemaining)$/i.test(key) && typeof child === 'number' && Number.isFinite(child)) {
-        return Math.max(0, Math.min(100, 100 - child))
+        const usedPercent = Math.max(0, Math.min(100, 100 - child))
+        maximumUsedPercent = Math.max(maximumUsedPercent ?? 0, usedPercent)
       }
       if (child && typeof child === 'object') queue.push(child)
     }
   }
-  return undefined
+  return maximumUsedPercent
 }
 
 function errorText(error: unknown): string {

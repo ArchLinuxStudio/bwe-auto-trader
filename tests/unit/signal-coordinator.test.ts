@@ -146,6 +146,35 @@ describe('SignalCoordinator', () => {
     expect(test.openTrade).toHaveBeenCalledOnce()
   })
 
+  it('publishes received and analyzing before the AI result settles', async () => {
+    let releaseAnalysis!: (value: TradingSignalAnalysis) => void
+    const analyze = vi.fn(() => new Promise<TradingSignalAnalysis>((resolve) => {
+      releaseAnalysis = resolve
+    }))
+    const publishedStages: string[] = []
+    const coordinator = new SignalCoordinator({
+      now: () => 1_000,
+      settings: () => settings,
+      safety: () => armedSafety({ liveArmed: false }),
+      analyze,
+      readPositions: async () => [],
+      openTrade: vi.fn(),
+      onRecord: (record) => {
+        publishedStages.push(record.stage)
+      }
+    })
+
+    const processing = coordinator.process(message(1_000, 2))
+    await vi.waitFor(() => expect(analyze).toHaveBeenCalledOnce())
+
+    expect(publishedStages).toEqual(['received', 'analyzing'])
+    expect(coordinator.history[0]).toMatchObject({ stage: 'analyzing' })
+    expect(coordinator.history[0]?.analysis).toBeUndefined()
+
+    releaseAnalysis(analysis({ decision: 'SKIP', status: 'skipped' }))
+    await expect(processing).resolves.toMatchObject({ stage: 'skipped' })
+  })
+
   it('shows the analysis but blocks orders while live trading is locked', async () => {
     const test = harness({ safety: { liveArmed: false } })
     const record = await processHarnessMessage(test, message(test.now()))
@@ -244,6 +273,33 @@ describe('SignalCoordinator', () => {
     expect(multi.openTrade).not.toHaveBeenCalled()
     expect(timeout.openTrade).not.toHaveBeenCalled()
     expect(stale.openTrade).not.toHaveBeenCalled()
+  })
+
+  it('keeps accepting messages when ChatGPT quota is exhausted without crossing the order boundary', async () => {
+    const test = harness({
+      analysis: analysis({
+        symbols: [],
+        decision: 'SKIP',
+        confidence: 0,
+        reason: 'ChatGPT usage limit has been reached',
+        status: 'skipped',
+        failureCode: 'quota_exceeded'
+      })
+    })
+
+    const first = await processHarnessMessage(test, message(test.now(), 21))
+    const second = await processHarnessMessage(test, message(test.now(), 22))
+
+    expect(first).toMatchObject({
+      stage: 'skipped',
+      analysis: { reason: expect.stringContaining('额度已用尽') },
+      detail: expect.stringContaining('监听继续运行')
+    })
+    expect(second).toMatchObject({ stage: 'skipped' })
+    expect(test.coordinator.history).toHaveLength(2)
+    expect(test.safety.monitoring).toBe(true)
+    expect(test.openTrade).not.toHaveBeenCalled()
+    expect(test.notices).not.toContain('本条消息已跳过')
   })
 
   it('enforces max one position and the 60 minute cooldown after a fill', async () => {
@@ -495,6 +551,169 @@ describe('SignalCoordinator', () => {
     })
     expect(test.analyze).not.toHaveBeenCalled()
     expect(test.openTrade).not.toHaveBeenCalled()
+  })
+
+  it('reuses one recovered observation for canonical analysis without duplicate or order', async () => {
+    const safety = armedSafety()
+    let releaseAnalysis!: (value: TradingSignalAnalysis) => void
+    const analyze = vi.fn(() => new Promise<TradingSignalAnalysis>((resolve) => {
+      releaseAnalysis = resolve
+    }))
+    const openTrade = vi.fn()
+    const publishedStages: string[] = []
+    const coordinator = new SignalCoordinator({
+      now: () => 1_000,
+      settings: () => settings,
+      safety: () => safety,
+      analyze,
+      readPositions: async () => [],
+      openTrade,
+      onRecord: (record) => {
+        publishedStages.push(record.stage)
+      }
+    })
+    const observed = message(1_000, 502)
+    observed.recovered = true
+
+    await expect(coordinator.observeRecovered(observed)).resolves.toMatchObject({
+      stage: 'received',
+      telegram: { recovered: true }
+    })
+    expect(coordinator.history).toHaveLength(1)
+    expect(analyze).not.toHaveBeenCalled()
+
+    const canonical = { ...observed, recovered: false }
+    const processing = coordinator.process(canonical, safety.authorizationToken)
+    await vi.waitFor(() => expect(analyze).toHaveBeenCalledOnce())
+
+    expect(publishedStages).toEqual(['received', 'analyzing'])
+    expect(coordinator.history).toHaveLength(1)
+    expect(coordinator.history[0]).toMatchObject({
+      stage: 'analyzing',
+      telegram: { recovered: true }
+    })
+
+    releaseAnalysis(analysis())
+    await expect(processing).resolves.toMatchObject({
+      stage: 'skipped',
+      analysis: { decision: 'LONG' },
+      telegram: { recovered: true }
+    })
+    expect(coordinator.history).toHaveLength(1)
+    expect(openTrade).not.toHaveBeenCalled()
+
+    await expect(coordinator.process(canonical, safety.authorizationToken)).resolves.toBeUndefined()
+    expect(analyze).toHaveBeenCalledOnce()
+    expect(openTrade).not.toHaveBeenCalled()
+  })
+
+  it('finalizes a recovered observation when monitoring stops before canonical processing', async () => {
+    const test = harness()
+    const observed = message(test.now(), 503)
+    observed.recovered = true
+    await test.coordinator.observeRecovered(observed)
+    test.safety.monitoring = false
+
+    await expect(processHarnessMessage(test, observed)).resolves.toMatchObject({
+      stage: 'skipped',
+      detail: expect.stringContaining('未进入 AI 分析')
+    })
+    expect(test.coordinator.history).toHaveLength(1)
+    expect(test.analyze).not.toHaveBeenCalled()
+    expect(test.openTrade).not.toHaveBeenCalled()
+  })
+
+  it('discards a pending recovery observation when its monitoring flow is abandoned', async () => {
+    const test = harness()
+    const observed = message(test.now(), 504)
+    observed.recovered = true
+    await test.coordinator.observeRecovered(observed)
+
+    await test.coordinator.finalizePendingRecoveryObservations(
+      'Telegram 已断开，等待连续性校验的消息未进入 AI 分析'
+    )
+
+    expect(test.coordinator.history).toEqual([
+      expect.objectContaining({
+        id: `${observed.channelId}:${observed.messageId}`,
+        stage: 'skipped',
+        detail: expect.stringContaining('Telegram 已断开'),
+        telegram: expect.objectContaining({ recovered: true })
+      })
+    ])
+    await expect(processHarnessMessage(test, observed)).resolves.toBeUndefined()
+    expect(test.analyze).not.toHaveBeenCalled()
+    expect(test.openTrade).not.toHaveBeenCalled()
+  })
+
+  it('atomically consumes every abandoned observation before publishing skipped records', async () => {
+    let releaseFirstSkip!: () => void
+    let firstSkipStarted!: () => void
+    const firstSkip = new Promise<void>((resolve) => { firstSkipStarted = resolve })
+    const analyze = vi.fn(async () => analysis())
+    const safety = armedSafety()
+    const coordinator = new SignalCoordinator({
+      now: () => 1_000,
+      settings: () => settings,
+      safety: () => safety,
+      analyze,
+      readPositions: async () => [],
+      openTrade: vi.fn(),
+      onRecord: (record) => {
+        if (record.id === 'bwe:505' && record.stage === 'skipped') {
+          firstSkipStarted()
+          return new Promise<void>((resolve) => { releaseFirstSkip = resolve })
+        }
+      }
+    })
+    const first = message(1_000, 505)
+    const second = message(1_000, 506)
+    first.recovered = true
+    second.recovered = true
+    await coordinator.observeRecovered(first)
+    await coordinator.observeRecovered(second)
+
+    const finalizing = coordinator.finalizePendingRecoveryObservations(
+      '监听已停止，等待连续性校验的消息未进入 AI 分析'
+    )
+    await firstSkip
+
+    await expect(coordinator.process(second, safety.authorizationToken)).resolves.toBeUndefined()
+    expect(analyze).not.toHaveBeenCalled()
+
+    releaseFirstSkip()
+    await finalizing
+    expect(coordinator.history).toHaveLength(2)
+    expect(coordinator.history.every((record) => record.stage === 'skipped')).toBe(true)
+  })
+
+  it('terminally stores every abandoned observation even if one record callback rejects', async () => {
+    const callbackError = new Error('snapshot listener failed')
+    const coordinator = new SignalCoordinator({
+      now: () => 1_000,
+      settings: () => settings,
+      safety: () => armedSafety(),
+      analyze: vi.fn(async () => analysis()),
+      readPositions: async () => [],
+      openTrade: vi.fn(),
+      onRecord: (record) => {
+        if (record.id === 'bwe:507' && record.stage === 'skipped') throw callbackError
+      }
+    })
+    const first = message(1_000, 507)
+    const second = message(1_000, 508)
+    first.recovered = true
+    second.recovered = true
+    await coordinator.observeRecovered(first)
+    await coordinator.observeRecovered(second)
+
+    await expect(
+      coordinator.finalizePendingRecoveryObservations('监听已停止，未进入 AI 分析')
+    ).rejects.toBe(callbackError)
+
+    expect(coordinator.history).toHaveLength(2)
+    expect(coordinator.history.every((record) => record.stage === 'skipped')).toBe(true)
+    await expect(coordinator.process(second)).resolves.toBeUndefined()
   })
 
   it('analyzes a fresh recovered delivery but never lets a later arm authorize it', async () => {

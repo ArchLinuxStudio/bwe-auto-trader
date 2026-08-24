@@ -65,6 +65,7 @@ export interface ChatGptServiceStatus {
   selectedModel: string | null
   reasoningEffort: string | null
   rateLimits: ChatGptRateLimits | null
+  quotaExhausted: boolean
   lastError: string | null
 }
 
@@ -484,6 +485,7 @@ export interface ChatGptServiceOptions {
   cwd?: string
   timeoutMs?: number
   maxTurnsPerThread?: number
+  quotaRefreshIntervalMs?: number
   now?: () => number
 }
 
@@ -549,6 +551,7 @@ export class ChatGptService {
   private readonly transport: CodexAppServerTransport
   private readonly timeoutMs: number
   private readonly maxTurnsPerThread: number
+  private readonly quotaRefreshIntervalMs: number
   private readonly now: () => number
   private readonly statusListeners = new Set<(status: ChatGptServiceStatus) => void>()
   private readonly loginWaiters = new Map<string, Array<(result: LoginCompletion) => void>>()
@@ -557,6 +560,9 @@ export class ChatGptService {
   private readonly turnWaiters = new Map<string, TurnWaiter[]>()
   private unsubscribeNotifications: (() => void) | null = null
   private startPromise: Promise<void> | null = null
+  private rateLimitsRefreshPromise: Promise<void> | null = null
+  private rateLimitsEvidenceRevision = 0
+  private quotaRefreshNotBefore = 0
   private queueTail: Promise<void> = Promise.resolve()
   private threadId: string | null = null
   private turnsOnThread = 0
@@ -569,6 +575,7 @@ export class ChatGptService {
     selectedModel: null,
     reasoningEffort: null,
     rateLimits: null,
+    quotaExhausted: false,
     lastError: null,
   }
 
@@ -582,6 +589,7 @@ export class ChatGptService {
       })
     this.timeoutMs = options.timeoutMs ?? 10_000
     this.maxTurnsPerThread = options.maxTurnsPerThread ?? 100
+    this.quotaRefreshIntervalMs = Math.max(1, options.quotaRefreshIntervalMs ?? 60_000)
     this.now = options.now ?? Date.now
   }
 
@@ -620,6 +628,7 @@ export class ChatGptService {
     this.updateStatus({
       account,
       authenticated: isChatGptAccount(account),
+      ...(!isChatGptAccount(account) ? { rateLimits: null, quotaExhausted: false } : {}),
       lastError: null,
     })
     return account
@@ -696,6 +705,7 @@ export class ChatGptService {
       warmedUp: false,
       account: null,
       rateLimits: null,
+      quotaExhausted: false,
       lastError: null,
     })
   }
@@ -729,14 +739,18 @@ export class ChatGptService {
   async readRateLimits(): Promise<ChatGptRateLimits | null> {
     await this.start()
     if (!this.status.authenticated) {
-      this.updateStatus({ rateLimits: null })
+      this.updateStatus({ rateLimits: null, quotaExhausted: false })
       return null
     }
 
+    const requestedRevision = this.rateLimitsEvidenceRevision
     try {
       const result = await this.transport.request<ChatGptRateLimits>('account/rateLimits/read')
-      this.updateStatus({ rateLimits: result })
-      return result
+      const outcome = this.commitRateLimitsRead(result, requestedRevision)
+      if (outcome === 'superseded' && this.status.quotaExhausted) {
+        this.refreshRateLimitsAuthoritatively()
+      }
+      return outcome === 'committed' ? result : this.getStatus().rateLimits
     } catch (error) {
       this.updateStatus({ lastError: errorMessage(error) })
       return null
@@ -779,7 +793,12 @@ export class ChatGptService {
     this.startPromise = null
     this.threadId = null
     this.turnsOnThread = 0
-    this.updateStatus({ initialized: false, busy: false, warmedUp: false })
+    this.updateStatus({
+      initialized: false,
+      busy: false,
+      warmedUp: false,
+      quotaExhausted: false,
+    })
   }
 
   private async initialize(): Promise<void> {
@@ -791,7 +810,7 @@ export class ChatGptService {
       clientInfo: {
         name: 'bwe_auto_trader',
         title: 'BWE Auto Trader',
-        version: '0.1.6',
+        version: '0.1.7',
       },
       capabilities: {
         optOutNotificationMethods: [
@@ -821,7 +840,11 @@ export class ChatGptService {
       requiresOpenaiAuth?: boolean
     }>('account/read', { refreshToken: false })
     const account = result.account ?? null
-    this.updateStatus({ account, authenticated: isChatGptAccount(account) })
+    this.updateStatus({
+      account,
+      authenticated: isChatGptAccount(account),
+      ...(!isChatGptAccount(account) ? { rateLimits: null, quotaExhausted: false } : {}),
+    })
   }
 
   private async loadModelsWithoutStarting(): Promise<void> {
@@ -837,11 +860,15 @@ export class ChatGptService {
   }
 
   private async loadRateLimitsWithoutStarting(): Promise<void> {
+    const requestedRevision = this.rateLimitsEvidenceRevision
     try {
       const result = await this.transport.request<ChatGptRateLimits>('account/rateLimits/read')
-      this.updateStatus({ rateLimits: result })
+      const outcome = this.commitRateLimitsRead(result, requestedRevision)
+      if (outcome === 'superseded' && this.status.quotaExhausted) {
+        this.refreshRateLimitsAuthoritatively()
+      }
     } catch {
-      this.updateStatus({ rateLimits: null })
+      if (!this.status.quotaExhausted) this.updateStatus({ rateLimits: null })
     }
   }
 
@@ -903,7 +930,7 @@ export class ChatGptService {
     if (!this.status.selectedModel) {
       return this.failure('model_unavailable', 'No low-latency ChatGPT model is available', requestedAt)
     }
-    if (isQuotaExhausted(this.status.rateLimits)) {
+    if (this.status.quotaExhausted || isQuotaExhausted(this.status.rateLimits)) {
       return this.failure('quota_exceeded', 'ChatGPT usage limit has been reached', requestedAt)
     }
 
@@ -945,6 +972,9 @@ export class ChatGptService {
 
       const record = await this.waitForTurn(turnId, controller.signal)
       if (turnStatus(record) !== 'completed') {
+        if (isStructuredUsageLimitFailure(record.turn) || isStructuredUsageLimitFailure(record.error)) {
+          return this.failure('quota_exceeded', safeAnalysisErrorReason('quota_exceeded'), requestedAt)
+        }
         const message = turnErrorMessage(record)
         throw new Error(message || `ChatGPT turn ended with status ${turnStatus(record)}`)
       }
@@ -953,6 +983,13 @@ export class ChatGptService {
       const parsed = parseSignalOutput(finalText)
       if (!parsed) {
         return this.failure('invalid_response', 'AI returned an invalid structured result', requestedAt)
+      }
+
+      // A turn that started before a quota notification is no longer eligible
+      // to produce a tradeable result. Keep the downstream coordinator on the
+      // same explicit quota SKIP path as messages received after exhaustion.
+      if (this.status.quotaExhausted || isQuotaExhausted(this.status.rateLimits)) {
+        return this.failure('quota_exceeded', 'ChatGPT usage limit has been reached', requestedAt)
       }
 
       const result: TradingSignalAnalysis = {
@@ -996,7 +1033,13 @@ export class ChatGptService {
     reason: string,
     requestedAt: number,
   ): TradingSignalAnalysis {
-    if (failureCode !== 'cancelled' && failureCode !== 'invalid_response') {
+    if (failureCode === 'quota_exceeded') {
+      if (!this.status.quotaExhausted) {
+        this.rateLimitsEvidenceRevision += 1
+        this.updateStatus({ quotaExhausted: true })
+      }
+      this.maybeRefreshExhaustedQuota()
+    } else if (failureCode !== 'cancelled' && failureCode !== 'invalid_response') {
       this.updateStatus({ lastError: reason })
     }
     return {
@@ -1066,13 +1109,26 @@ export class ChatGptService {
         account: authenticated
           ? { ...(this.status.account ?? {}), type: authMode, planType }
           : null,
-        ...(authenticated ? {} : { warmedUp: false }),
+        ...(authenticated
+          ? {}
+          : { warmedUp: false, rateLimits: null, quotaExhausted: false }),
       })
       return
     }
 
     if (notification.method === 'account/rateLimits/updated') {
-      this.updateStatus({ rateLimits: (params ?? null) as ChatGptRateLimits | null })
+      this.rateLimitsEvidenceRevision += 1
+      const wasQuotaExhausted = this.status.quotaExhausted
+      const rateLimits = mergeRateLimitNotification(this.status.rateLimits, params)
+      this.updateStatus({
+        rateLimits,
+        // A rolling update is intentionally sparse. Once exhaustion is known,
+        // only a successful full read for the latest notification revision may
+        // clear it; otherwise a delayed or failed read could briefly re-enable
+        // analysis and trading authorization.
+        quotaExhausted: wasQuotaExhausted || isQuotaExhausted(rateLimits),
+      })
+      if (wasQuotaExhausted) this.refreshRateLimitsAuthoritatively()
       return
     }
 
@@ -1114,8 +1170,57 @@ export class ChatGptService {
     this.turnRecords.clear()
   }
 
+  private maybeRefreshExhaustedQuota(): void {
+    if (!this.status.authenticated || !this.status.quotaExhausted) return
+    if (this.rateLimitsRefreshPromise) return
+    const now = this.now()
+    if (now < this.quotaRefreshNotBefore) return
+    this.quotaRefreshNotBefore = now + this.quotaRefreshIntervalMs
+    this.refreshRateLimitsAuthoritatively()
+  }
+
+  private refreshRateLimitsAuthoritatively(): void {
+    if (!this.status.authenticated) return
+    if (this.rateLimitsRefreshPromise) return
+    this.rateLimitsRefreshPromise = (async () => {
+      try {
+        while (this.status.authenticated) {
+          const requestedRevision = this.rateLimitsEvidenceRevision
+          try {
+            const result = await this.transport.request<ChatGptRateLimits>('account/rateLimits/read')
+            const outcome = this.commitRateLimitsRead(result, requestedRevision)
+            if (outcome === 'superseded') continue
+            return
+          } catch {
+            // If a newer notification arrived, retry for that revision. A
+            // failure for the latest revision preserves the sticky exhausted
+            // state established by the rolling update.
+            if (requestedRevision !== this.rateLimitsEvidenceRevision) continue
+            return
+          }
+        }
+      } finally {
+        this.rateLimitsRefreshPromise = null
+      }
+    })()
+  }
+
+  private commitRateLimitsRead(
+    result: ChatGptRateLimits,
+    requestedRevision: number,
+  ): 'committed' | 'superseded' | 'unauthenticated' {
+    if (!this.status.authenticated) return 'unauthenticated'
+    if (requestedRevision !== this.rateLimitsEvidenceRevision) return 'superseded'
+    this.updateStatus({
+      rateLimits: result,
+      quotaExhausted: isQuotaExhausted(result),
+    })
+    return 'committed'
+  }
+
   private updateStatus(patch: Partial<ChatGptServiceStatus>): void {
     this.status = { ...this.status, ...patch }
+    if (!this.status.quotaExhausted) this.quotaRefreshNotBefore = 0
     const snapshot = this.getStatus()
     for (const listener of this.statusListeners) {
       try {
@@ -1364,6 +1469,7 @@ function errorMessage(error: unknown): string {
 }
 
 function classifyAnalysisError(error: unknown): AnalysisFailureCode {
+  if (isStructuredUsageLimitFailure(error)) return 'quota_exceeded'
   const text = errorMessage(error).toLowerCase()
   if (/unauthori[sz]ed|authentication|login|required auth|401/.test(text)) return 'not_authenticated'
   if (/usage.?limit|rate.?limit|quota|credit/.test(text)) return 'quota_exceeded'
@@ -1389,15 +1495,114 @@ function safeAnalysisErrorReason(code: AnalysisFailureCode): string {
 
 function isQuotaExhausted(limits: ChatGptRateLimits | null): boolean {
   if (!limits) return false
-  const buckets: unknown[] = []
-  if (limits.rateLimits) buckets.push(limits.rateLimits)
-  if (limits.rateLimitsByLimitId) buckets.push(...Object.values(limits.rateLimitsByLimitId))
+  const queue: unknown[] = [limits]
+  const visited = new Set<unknown>()
+  while (queue.length) {
+    const current = queue.shift()
+    const record = asRecord(current)
+    if (!record || visited.has(current)) continue
+    visited.add(current)
 
-  return buckets.some((bucketValue) => {
-    const bucket = asRecord(bucketValue)
-    if (!bucket) return false
-    if (typeof bucket.rateLimitReachedType === 'string' && bucket.rateLimitReachedType) return true
-    const primary = asRecord(bucket.primary)
-    return typeof primary?.usedPercent === 'number' && primary.usedPercent >= 100
-  })
+    if (record.spendControlReached === true) return true
+    if (typeof record.rateLimitReachedType === 'string') {
+      const reachedType = record.rateLimitReachedType.trim().toLowerCase()
+      if (reachedType && !['none', 'notreached', 'not_reached'].includes(reachedType)) return true
+    }
+
+    for (const [key, child] of Object.entries(record)) {
+      if (
+        /^(usedPercent|percentUsed)$/i.test(key) &&
+        typeof child === 'number' &&
+        Number.isFinite(child) &&
+        child >= 100
+      ) {
+        return true
+      }
+      if (
+        /^(remainingPercent|percentRemaining)$/i.test(key) &&
+        typeof child === 'number' &&
+        Number.isFinite(child) &&
+        child <= 0
+      ) {
+        return true
+      }
+      if (child && typeof child === 'object') queue.push(child)
+    }
+  }
+  return false
+}
+
+function isStructuredUsageLimitFailure(value: unknown): boolean {
+  const queue: unknown[] = [value]
+  const visited = new Set<unknown>()
+  while (queue.length) {
+    const current = queue.shift()
+    if (typeof current === 'string') {
+      if (current.replace(/[^a-z]/gi, '').toLowerCase() === 'usagelimitexceeded') return true
+      continue
+    }
+    const record = asRecord(current)
+    if (!record || visited.has(current)) continue
+    visited.add(current)
+    for (const child of Object.values(record)) queue.push(child)
+  }
+  return false
+}
+
+function mergeRateLimitNotification(
+  current: ChatGptRateLimits | null,
+  patch: unknown,
+): ChatGptRateLimits | null {
+  const patchRecord = asRecord(patch)
+  if (!patchRecord) return current
+  const patchSnapshot = asRecord(patchRecord.rateLimits)
+  if (!patchSnapshot) return current
+
+  const currentRecord = current ?? {}
+  const currentSnapshot = asRecord(currentRecord.rateLimits)
+  const patchLimitId = nonEmptyString(patchSnapshot.limitId)
+  const currentLimitId = nonEmptyString(currentSnapshot?.limitId)
+  const effectiveLimitId = patchLimitId ?? currentLimitId
+  const next: ChatGptRateLimits = { ...currentRecord }
+
+  if (!currentSnapshot || !patchLimitId || !currentLimitId || patchLimitId === currentLimitId) {
+    next.rateLimits = mergeSparseRecords(currentSnapshot ?? {}, patchSnapshot)
+  }
+
+  if (effectiveLimitId) {
+    const currentByLimitId = asRecord(currentRecord.rateLimitsByLimitId)
+    const currentBucket = asRecord(currentByLimitId?.[effectiveLimitId])
+    const matchingRoot = !patchLimitId || !currentLimitId || patchLimitId === currentLimitId
+      ? currentSnapshot
+      : null
+    next.rateLimitsByLimitId = {
+      ...(currentByLimitId ?? {}),
+      [effectiveLimitId]: mergeSparseRecords(currentBucket ?? matchingRoot ?? {}, patchSnapshot),
+    }
+  }
+
+  return next
+}
+
+function mergeSparseRecords(
+  current: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...current }
+  for (const [key, patchValue] of Object.entries(patch)) {
+    // In account/rateLimits/updated, null means that nullable metadata was
+    // unavailable in this rolling update. Only a full read may authoritatively
+    // replace a prior value with null.
+    if (patchValue === null || patchValue === undefined) continue
+    const currentRecord = asRecord(current[key])
+    const patchRecord = asRecord(patchValue)
+    merged[key] = currentRecord && patchRecord
+      ? mergeSparseRecords(currentRecord, patchRecord)
+      : patchValue
+  }
+  return merged
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
 }

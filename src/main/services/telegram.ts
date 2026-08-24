@@ -86,6 +86,11 @@ export interface TelegramIgnoredMessage {
 }
 
 export interface TelegramMonitorCallbacks {
+  /**
+   * Display-only notification for a raw live update held behind startup or
+   * recovery verification. It never carries a trading authorization token.
+   */
+  onMessageObserved?: (message: TelegramSignalMessage) => void | Promise<void>
   onMessage?: (
     message: TelegramSignalMessage,
     context: TelegramMessageDispatchContext,
@@ -185,12 +190,14 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private stateValue: TelegramMonitorState = 'idle'
   private activeProxyProtocol?: Exclude<TelegramProxyProtocol, 'auto'>
   private readonly deduplicator: BoundedMessageDeduplicator
+  private readonly observationDeduplicator: BoundedMessageDeduplicator
   private authBroker = new AuthPromptBroker((request) => this.notifyAuthRequired(request))
 
   constructor(private readonly options: TelegramMonitorOptions) {
     super()
     validateOptions(options)
     this.deduplicator = new BoundedMessageDeduplicator(options.deduplicationCapacity)
+    this.observationDeduplicator = new BoundedMessageDeduplicator(options.deduplicationCapacity)
     // Keep callback-only integrations from triggering EventEmitter's special
     // unhandled "error" behavior. Consumer error listeners still run normally.
     super.on('error', () => undefined)
@@ -306,6 +313,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.bufferingInitialMessages = false
     this.initialMessageBuffer = []
     this.deduplicator.clear()
+    this.observationDeduplicator.clear()
     this.setState('stopped')
   }
 
@@ -334,6 +342,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.clearRecoveryConfirmationTimer()
     this.authBroker = new AuthPromptBroker((request) => this.notifyAuthRequired(request))
     this.deduplicator.clear()
+    this.observationDeduplicator.clear()
     this.startupBaselineId = 0
     this.lastSeenMessageId = 0
     this.reconnecting = false
@@ -557,7 +566,9 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     authorizationToken?: SignalTradeAuthorizationToken,
   ): Promise<void> {
     if (this.recoveryPending || this.reconnecting) {
-      this.bufferRecoveryMessage(raw, receivedAt, authorizationToken)
+      if (this.bufferRecoveryMessage(raw, receivedAt, authorizationToken)) {
+        this.observeBufferedRawMessage(raw, receivedAt)
+      }
       return Promise.resolve()
     }
 
@@ -589,6 +600,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     }
     if (this.bufferingInitialMessages) {
       this.initialMessageBuffer.push(queuedMessage)
+      this.observeBufferedRawMessage(queuedMessage.raw, queuedMessage.receivedAt)
       return
     }
     void this.enqueueRawMessage(
@@ -613,7 +625,9 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     // processing chain. Preserve it for the atomic recovery merge instead of
     // consuming its dedupe key or silently losing it.
     if (this.recoveryPending || this.reconnecting) {
-      this.bufferRecoveryMessage(raw, receivedAt, authorizationToken)
+      if (this.bufferRecoveryMessage(raw, receivedAt, authorizationToken)) {
+        this.observeBufferedRawMessage(raw, receivedAt)
+      }
       return
     }
 
@@ -658,6 +672,29 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     }
 
     this.dispatchMessage(signal, { authorizationToken })
+  }
+
+  private observeBufferedRawMessage(raw: Api.Message, receivedAt: Date): void {
+    if (this.stopRequested || !this.options.callbacks?.onMessageObserved) return
+    const id = raw.id
+    if (!Number.isSafeInteger(id) || id <= 0 || id <= this.startupBaselineId) return
+
+    const channel = this.channelEntity as unknown as {
+      id?: { toString(): string } | number | string
+      title?: string
+    }
+    const signal = extractTelegramSignalMessage(raw, {
+      channelUsername: this.channelUsername,
+      channelId: channel?.id?.toString(),
+      channelTitle: channel?.title,
+      receivedAt,
+      recovered: true,
+    })
+    if (!signal) return
+
+    const key = telegramMessageKey(this.channelUsername, id)
+    if (!this.observationDeduplicator.accept(key)) return
+    this.dispatchObservedMessage(signal)
   }
 
   private async catchUpMessages(fromMessageId = this.lastSeenMessageId): Promise<void> {
@@ -967,13 +1004,14 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     raw: Api.Message,
     receivedAt: Date,
     authorizationToken?: SignalTradeAuthorizationToken,
-  ): void {
-    if (this.stopRequested || this.recoveryBufferOverflow) return
+  ): boolean {
+    if (this.stopRequested || this.recoveryBufferOverflow) return false
     if (this.recoveryMessageBuffer.length >= MAX_RECOVERY_BUFFER_MESSAGES) {
       this.recoveryBufferOverflow = true
-      return
+      return false
     }
     this.recoveryMessageBuffer.push({ raw, receivedAt, recovered: true, authorizationToken })
+    return true
   }
 
   private async persistSession(): Promise<void> {
@@ -1036,12 +1074,21 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     message: TelegramSignalMessage,
     context: TelegramMessageDispatchContext,
   ): void {
+    this.scheduleMessageDelivery(() => this.deliverMessage(message, context))
+  }
+
+  private dispatchObservedMessage(message: TelegramSignalMessage): void {
+    this.scheduleMessageDelivery(() => this.deliverObservedMessage(message))
+  }
+
+  private scheduleMessageDelivery(deliver: () => Promise<void>): void {
     // setImmediate deliberately leaves the transport Promise chain first. This
     // keeps a slow AI/network callback from delaying validation and dispatch of
-    // later Telegram updates while retaining FIFO callback start order.
+    // later Telegram updates. Display-only observations use the same bounded
+    // drain so shutdown cannot strand their callbacks.
     const task = new Promise<void>((resolve) => {
       setImmediate(() => {
-        void this.deliverMessage(message, context)
+        void deliver()
           .catch((error) => this.reportError(error, true))
           .finally(resolve)
       })
@@ -1050,6 +1097,11 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     void task.finally(() => {
       this.messageDispatches.delete(task)
     })
+  }
+
+  private async deliverObservedMessage(message: TelegramSignalMessage): Promise<void> {
+    if (this.stopRequested) return
+    await this.invokeCallback(this.options.callbacks?.onMessageObserved, message)
   }
 
   private async deliverMessage(

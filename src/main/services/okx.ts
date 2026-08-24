@@ -96,6 +96,19 @@ export interface OkxCredentials {
   passphrase: string
 }
 
+export interface OkxMutationLifecycleEvent {
+  phase: 'prepared' | 'transmitting' | 'accepted' | 'unknown' | 'terminal'
+  operation: OkxTradeArmScope
+  instId: string
+  clOrdId: string
+  createdAt: number
+  updatedAt: number
+  intentExpiresAt: number
+  exchangeExpiresAt?: number
+  ordId?: string
+  terminalEvidence?: 'not_transmitted' | 'rejected'
+}
+
 export interface OkxClientOptions {
   credentials: OkxCredentials
   restBaseUrl?: string
@@ -116,6 +129,13 @@ export interface OkxClientOptions {
   lookupImpl?: typeof dnsLookup
   requestTimeoutMs?: number
   directProbeTimeoutMs?: number
+  /**
+   * Main-process durable mutation hook. A `prepared`/`transmitting` failure
+   * prevents the order fetch; post-boundary failures remain interlocked.
+   */
+  onMutationLifecycle?(
+    event: Readonly<OkxMutationLifecycleEvent>
+  ): void | Promise<void>
   /**
    * Permits custom endpoints and injected network transports only in an
    * explicit test rig. Never set this in the packaged application.
@@ -433,6 +453,11 @@ interface OkxOrderResponseItem {
   ts?: string
   sCode: string
   sMsg: string
+}
+
+interface RequestBoundaryHooks {
+  beforeFetch?(context: { exchangeExpiresAt?: number }): void | Promise<void>
+  finalGuard?(): void
 }
 
 export class OkxApiError extends Error {
@@ -1474,6 +1499,7 @@ export class OkxV5Client {
   private readonly lookupImpl: typeof dnsLookup
   private readonly requestTimeoutMs: number
   private readonly directProbeTimeoutMs: number
+  private readonly onMutationLifecycle?: OkxClientOptions['onMutationLifecycle']
   private selectedRestFetchImpl?: FetchLike
   private restRoute?: OkxRouteSelection
   private privateWebSocketRoute?: OkxRouteSelection
@@ -1575,6 +1601,7 @@ export class OkxV5Client {
     this.randomId =
       options.randomId ?? (() => randomBytes(8).toString('hex'))
     this.lookupImpl = options.lookupImpl ?? dnsLookup
+    this.onMutationLifecycle = options.onMutationLifecycle
   }
 
   get isLiveTradingArmed(): boolean {
@@ -2596,7 +2623,19 @@ export class OkxV5Client {
     // Keep time sync outside the ambiguous-result boundary: if this read-only
     // prerequisite fails, the order endpoint was never called.
     await this.ensureServerTimeSynchronized()
+    this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
     this.assertExternalTransmissionGuard(transmissionGuard)
+    const createdAt = this.now()
+    await this.emitMutationLifecycle({
+      phase: 'prepared',
+      operation,
+      instId,
+      clOrdId,
+      createdAt,
+      updatedAt: createdAt,
+      intentExpiresAt: expiresAt
+    })
+    let fetchMayStart = false
     try {
       const response = await this.request<OkxOrderResponseItem>(
         'POST',
@@ -2605,14 +2644,70 @@ export class OkxV5Client {
         body,
         true,
         expiresAt,
-        () => {
-          this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
-          this.assertExternalTransmissionGuard(transmissionGuard)
+        {
+          beforeFetch: async ({ exchangeExpiresAt }) => {
+            if (exchangeExpiresAt === undefined) {
+              throw new OkxConfigurationError(
+                'OKX order request is missing durable expiry evidence'
+              )
+            }
+            await this.emitMutationLifecycle({
+              phase: 'transmitting',
+              operation,
+              instId,
+              clOrdId,
+              createdAt,
+              updatedAt: this.now(),
+              intentExpiresAt: expiresAt,
+              exchangeExpiresAt
+            })
+          },
+          finalGuard: () => {
+            this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
+            this.assertExternalTransmissionGuard(transmissionGuard)
+            fetchMayStart = true
+          }
         }
       )
-      return this.requireSuccessfulOrderResponse(response, clOrdId)
+      const order = this.requireSuccessfulOrderResponse(response, clOrdId)
+      await this.emitMutationLifecycle({
+        phase: 'accepted',
+        operation,
+        instId,
+        clOrdId,
+        ordId: order.ordId,
+        createdAt,
+        updatedAt: this.now(),
+        intentExpiresAt: expiresAt
+      })
+      return order
     } catch (error) {
-      if (!this.isAmbiguousOrderSubmissionError(error)) throw error
+      if (!fetchMayStart) {
+        await this.emitMutationLifecycle({
+          phase: 'terminal',
+          operation,
+          instId,
+          clOrdId,
+          createdAt,
+          updatedAt: this.now(),
+          intentExpiresAt: expiresAt,
+          terminalEvidence: 'not_transmitted'
+        })
+        throw error
+      }
+      if (!this.isAmbiguousOrderSubmissionError(error)) {
+        await this.emitMutationLifecycle({
+          phase: 'terminal',
+          operation,
+          instId,
+          clOrdId,
+          createdAt,
+          updatedAt: this.now(),
+          intentExpiresAt: expiresAt,
+          terminalEvidence: 'rejected'
+        })
+        throw error
+      }
       const unknown = new OkxOrderStateUnknownError(
         instId,
         clOrdId,
@@ -2620,8 +2715,21 @@ export class OkxV5Client {
         this.now()
       )
       this.unknownOrderRecord = { error: unknown, clearAuthorized: false }
+      await this.emitMutationLifecycle({
+        phase: 'unknown',
+        operation,
+        instId,
+        clOrdId,
+        createdAt,
+        updatedAt: unknown.detectedAt,
+        intentExpiresAt: expiresAt
+      }).catch(() => undefined)
       throw unknown
     }
+  }
+
+  private async emitMutationLifecycle(event: OkxMutationLifecycleEvent): Promise<void> {
+    await this.onMutationLifecycle?.(Object.freeze({ ...event }))
   }
 
   private isAmbiguousOrderSubmissionError(error: unknown): boolean {
@@ -2724,7 +2832,7 @@ export class OkxV5Client {
       body,
       true,
       expTimeDeadlineAt,
-      beforeFetch
+      beforeFetch ? { finalGuard: beforeFetch } : undefined
     )
   }
 
@@ -2735,7 +2843,7 @@ export class OkxV5Client {
     body: unknown,
     authenticated: boolean,
     expTimeDeadlineAt?: number,
-    beforeFetch?: () => void
+    boundaryHooks?: RequestBoundaryHooks
   ): Promise<T[]> {
     await this.ensureRestRouteSelected()
     const fetchImpl = this.selectedRestFetchImpl
@@ -2759,6 +2867,7 @@ export class OkxV5Client {
       'Content-Type': 'application/json'
     }
 
+    let exchangeExpiresAt: number | undefined
     if (authenticated) {
       const timestamp = new Date(this.correctedNow()).toISOString()
       headers['OK-ACCESS-KEY'] = this.credentials.apiKey
@@ -2774,18 +2883,18 @@ export class OkxV5Client {
       if (expTimeDeadlineAt !== undefined) {
         const correctedIntentDeadline =
           expTimeDeadlineAt + this.serverTimeOffsetMs
-        headers['expTime'] = String(
-          Math.floor(
-            Math.min(this.correctedNow() + 5_000, correctedIntentDeadline)
-          )
+        exchangeExpiresAt = Math.floor(
+          Math.min(this.correctedNow() + 5_000, correctedIntentDeadline)
         )
+        headers['expTime'] = String(exchangeExpiresAt)
       }
     }
 
-    // This is the last synchronous boundary before the transport starts. Live
-    // generation and absolute intent/arm expiry are rechecked here after every
-    // route/time-sync await and after signing, so emergency disarm wins races.
-    beforeFetch?.()
+    // Durable mutation work may await here. The independent synchronous guard
+    // remains the final boundary after that await and immediately before the
+    // transport starts, so emergency disarm still wins the race.
+    await boundaryHooks?.beforeFetch?.({ exchangeExpiresAt })
+    boundaryHooks?.finalGuard?.()
 
     let response: Response
     try {

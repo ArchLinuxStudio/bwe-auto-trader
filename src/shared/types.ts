@@ -177,6 +177,7 @@ export interface AppSnapshot {
   pendingAuthPrompt?: AuthPrompt
   aiModel?: string
   aiQuotaPercent?: number
+  aiQuotaExhausted?: boolean
   lastError?: string
 }
 

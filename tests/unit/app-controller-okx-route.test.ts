@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -27,6 +27,11 @@ import type {
   OkxV5Client
 } from '../../src/main/services/okx'
 import { OkxOrderStateUnknownError, OkxTransportError } from '../../src/main/services/okx'
+import {
+  MUTATION_JOURNAL_FILE_NAME,
+  MutationJournalStore,
+  createOkxAccountFingerprint
+} from '../../src/main/services/mutation-journal'
 import type { SignalTradeAuthorizationToken } from '../../src/main/services/signal-coordinator'
 import type { AppPosition, SignalRecord, TelegramMessagePayload } from '../../src/shared/types'
 
@@ -526,6 +531,7 @@ describe('AppController OKX route integration', () => {
         posMode: 'net_mode',
         perm: 'read_only,trade',
         type: '1',
+        uid: 'test-sub-account-uid',
         ip: ''
       },
       checks: {
@@ -766,7 +772,8 @@ describe('AppController OKX route integration', () => {
         account: null
         selectedModel: string | null
         reasoningEffort: string | null
-        rateLimits: null
+        rateLimits: Record<string, unknown> | null
+        quotaExhausted: boolean
         lastError: string | null
       }): void
     }
@@ -814,6 +821,7 @@ describe('AppController OKX route integration', () => {
       selectedModel: 'test-fast',
       reasoningEffort: null,
       rateLimits: null,
+      quotaExhausted: false,
       lastError: 'test model unavailable'
     })
     expect(controller.getSnapshot()).toMatchObject({
@@ -829,9 +837,76 @@ describe('AppController OKX route integration', () => {
       selectedModel: 'test-fast',
       reasoningEffort: null,
       rateLimits: null,
+      quotaExhausted: false,
       lastError: null
     })
     expect(controller.getSnapshot().safety.liveArmed).toBe(false)
+    await controller.armLiveTrading('确认实盘')
+
+    const exhaustedStatus = {
+      initialized: true,
+      authenticated: true,
+      busy: false,
+      warmedUp: true,
+      account: null,
+      selectedModel: 'test-fast',
+      reasoningEffort: null,
+      rateLimits: {
+        rateLimits: {
+          primary: { usedPercent: 15 },
+          secondary: { usedPercent: 100 }
+        }
+      },
+      quotaExhausted: true,
+      lastError: null
+    }
+    internals.handleChatGptStatus(exhaustedStatus)
+    await vi.waitFor(() => {
+      expect(controller.getSnapshot()).toMatchObject({
+        connections: {
+          telegram: { phase: 'connected' },
+          chatgpt: {
+            phase: 'connected',
+            detail: expect.stringContaining('无法进行 AI 分析或自动下单')
+          }
+        },
+        safety: { monitoring: true, liveArmed: false, canArm: false },
+        aiQuotaPercent: 100,
+        aiQuotaExhausted: true
+      })
+    })
+    expect(controller.getSnapshot().notifications.filter(
+      (item) => item.title === 'ChatGPT 额度已用尽'
+    )).toHaveLength(1)
+    expect(captureSignalAuthorization(controller)).toBeUndefined()
+
+    internals.handleChatGptStatus(exhaustedStatus)
+    expect(controller.getSnapshot().notifications.filter(
+      (item) => item.title === 'ChatGPT 额度已用尽'
+    )).toHaveLength(1)
+
+    await controller.stopMonitoring('test quota monitoring restart')
+    await controller.startMonitoring()
+    expect(controller.getSnapshot()).toMatchObject({
+      safety: { monitoring: true, liveArmed: false, canArm: false },
+      aiQuotaExhausted: true
+    })
+
+    internals.handleChatGptStatus({
+      ...exhaustedStatus,
+      rateLimits: {
+        rateLimits: {
+          primary: { usedPercent: 15 },
+          secondary: { usedPercent: 30 }
+        }
+      },
+      quotaExhausted: false
+    })
+    expect(controller.getSnapshot()).toMatchObject({
+      safety: { monitoring: true, liveArmed: false },
+      aiQuotaPercent: 30,
+      aiQuotaExhausted: false
+    })
     await controller.armLiveTrading('确认实盘')
 
     const payload: TelegramMessagePayload = {
@@ -1222,6 +1297,902 @@ describe('AppController OKX route integration', () => {
     expect(audit).toContain('position_close_absence_confirmed')
     await controller.dispose()
   })
+
+  it('clears a crash-before-POST prepared marker at startup without creating an OKX client', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-pre-post-recovery-'))
+    temporaryDirectories.push(userDataDirectory)
+    await seedDurableMutation(userDataDirectory, { phase: 'prepared' })
+    const createOkxClient = vi.fn()
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient
+    })
+
+    await controller.initialize()
+
+    expect(createOkxClient).not.toHaveBeenCalled()
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .not.toContain('重启前订单 mutation')
+    await controller.dispose()
+  })
+
+  it('loads an accepted mutation locked, blocks credential replacement, and clears only matching terminal GET evidence', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-terminal-recovery-'))
+    temporaryDirectories.push(userDataDirectory)
+    const credentials = {
+      apiKey: 'restart-api-key-sensitive',
+      secretKey: 'restart-secret-sensitive',
+      passphrase: 'restart-passphrase-sensitive'
+    }
+    const setup = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await setup.initialize()
+    await setup.saveOkxCredentials(credentials)
+    await seedDurableMutation(userDataDirectory, { phase: 'accepted' })
+
+    const recovery = createReadOnlyRecoveryClient({
+      order: {
+        instType: 'SWAP',
+        instId: 'BTC-USDT-SWAP',
+        ordId: '99887766',
+        clOrdId: 'bwerestart1',
+        state: 'filled'
+      }
+    })
+    const createOkxClient = vi.fn(() => recovery.client)
+    const restarted = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient
+    })
+    await restarted.initialize()
+
+    expect(createOkxClient).not.toHaveBeenCalled()
+    expect(restarted.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('1 笔重启前订单 mutation')
+    await expect(restarted.saveOkxCredentials({
+      apiKey: 'replacement-api-key-sensitive',
+      secretKey: 'replacement-secret-sensitive',
+      passphrase: 'replacement-passphrase-sensitive'
+    })).rejects.toThrow('重启前订单 mutation')
+
+    await restarted.connectOkx()
+
+    expect(recovery.getOrder).toHaveBeenCalledWith({
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwerestart1'
+    })
+    expect(recovery.mutationCall).not.toHaveBeenCalled()
+    expect(recovery.createPrivateStream).toHaveBeenCalledTimes(1)
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    expect(restarted.getSnapshot().safety.armBlockers.join('；'))
+      .not.toContain('重启前订单 mutation')
+    await restarted.dispose()
+    await setup.dispose()
+  })
+
+  it('clears a transmitting restart record from exact terminal GET and rejects a conflicting late ACK', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-transmitting-recovery-'))
+    temporaryDirectories.push(userDataDirectory)
+    const setup = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await setup.initialize()
+    await setup.saveOkxCredentials({
+      apiKey: 'transmitting-api-key-sensitive',
+      secretKey: 'transmitting-secret-sensitive',
+      passphrase: 'transmitting-passphrase-sensitive'
+    })
+    await seedDurableMutation(userDataDirectory, { phase: 'transmitting' })
+    const recovery = createReadOnlyRecoveryClient({
+      order: {
+        instType: 'SWAP',
+        instId: 'BTC-USDT-SWAP',
+        ordId: 'transmittingrecovery1',
+        clOrdId: 'bwerestart1',
+        state: 'filled'
+      }
+    })
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const restarted = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await restarted.initialize()
+
+    await expect(restarted.connectOkx()).resolves.toBeUndefined()
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    expect(recovery.getOrder).toHaveBeenCalledWith({
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwerestart1'
+    })
+    expect(recovery.createPrivateStream).toHaveBeenCalledTimes(1)
+    expect(recovery.mutationCall).not.toHaveBeenCalled()
+    await expect(onMutationLifecycle?.({
+      phase: 'accepted',
+      operation: 'open',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwerestart1',
+      ordId: 'conflictinglateack1',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_003,
+      intentExpiresAt: 1_700_000_010_000
+    })).rejects.toThrow('本地订单恢复日志写入失败')
+    expect(restarted.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('本地订单恢复日志不可用')
+    await restarted.dispose()
+    await setup.dispose()
+  })
+
+  it('wires the OKX boundary hook to the journal and prevents late ACK from reviving a WS-terminal mutation', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-journal-hook-'))
+    temporaryDirectories.push(userDataDirectory)
+    const recovery = createReadOnlyRecoveryClient()
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await controller.initialize()
+    await controller.saveOkxCredentials({
+      apiKey: 'hook-api-key-sensitive',
+      secretKey: 'hook-secret-sensitive',
+      passphrase: 'hook-passphrase-sensitive'
+    })
+    await controller.connectOkx()
+    expect(onMutationLifecycle).toBeTypeOf('function')
+    const createdAt = 1_700_000_000_000
+    const baseEvent = {
+      operation: 'open' as const,
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwehookorder1',
+      createdAt,
+      intentExpiresAt: createdAt + 10_000
+    }
+
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'prepared',
+      updatedAt: createdAt
+    })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'transmitting',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 2,
+      ordId: 'hookorderid'
+    })
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+      expect.objectContaining({
+        lifecycleState: 'accepted',
+        ordId: 'hookorderid'
+      })
+    ])
+
+    recovery.stream.emit('orders', [{
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwehookorder1',
+      ordId: 'hookorderid',
+      state: 'partially_filled',
+      accFillSz: '0.1'
+    }])
+    await vi.waitFor(async () => {
+      await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+        expect.objectContaining({ lifecycleState: 'partially_filled' })
+      ])
+    })
+
+    recovery.stream.emit('orders', [{
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwehookorder1',
+      ordId: 'hookorderid',
+      state: 'filled',
+      accFillSz: '1'
+    }])
+    await vi.waitFor(async () => {
+      await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 3,
+      ordId: 'hookorderid'
+    })
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+
+    const blockedBeforeFetch = {
+      ...baseEvent,
+      clOrdId: 'bweblockedbeforefetch'
+    }
+    await onMutationLifecycle?.({
+      ...blockedBeforeFetch,
+      phase: 'prepared',
+      updatedAt: createdAt + 4
+    })
+    await onMutationLifecycle?.({
+      ...blockedBeforeFetch,
+      phase: 'transmitting',
+      updatedAt: createdAt + 5,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    await onMutationLifecycle?.({
+      ...blockedBeforeFetch,
+      phase: 'terminal',
+      updatedAt: createdAt + 6,
+      terminalEvidence: 'not_transmitted'
+    })
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+
+    const rejectedAfterLiveEvidence = {
+      ...baseEvent,
+      clOrdId: 'bwerejectedafterlive'
+    }
+    await onMutationLifecycle?.({
+      ...rejectedAfterLiveEvidence,
+      phase: 'prepared',
+      updatedAt: createdAt + 7
+    })
+    await onMutationLifecycle?.({
+      ...rejectedAfterLiveEvidence,
+      phase: 'transmitting',
+      updatedAt: createdAt + 8,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    const journalInternals = controller as unknown as {
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    await journalInternals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwerejectedafterlive',
+      ordId: 'observedliveorder1',
+      state: 'live'
+    })
+    await expect(onMutationLifecycle?.({
+      ...rejectedAfterLiveEvidence,
+      phase: 'terminal',
+      updatedAt: createdAt + 9,
+      terminalEvidence: 'rejected'
+    })).rejects.toThrow('本地订单恢复日志写入失败')
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+      expect.objectContaining({
+        clOrdId: 'bwerejectedafterlive',
+        ordId: 'observedliveorder1',
+        lifecycleState: 'live',
+        reconciliationState: 'matching_pending'
+      })
+    ])
+    await expect(journalInternals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bweblockedbeforefetch',
+      ordId: 'impossiblelateorder1',
+      state: 'live'
+    })).rejects.toThrow('已终态交易所订单号冲突')
+    expect(recovery.mutationCall).not.toHaveBeenCalled()
+    await controller.dispose()
+  })
+
+  it('serializes a concurrent terminal journal commit ahead of a late ACK', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-journal-race-'))
+    temporaryDirectories.push(userDataDirectory)
+    const recovery = createReadOnlyRecoveryClient()
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await controller.initialize()
+    await controller.saveOkxCredentials({
+      apiKey: 'race-api-key-sensitive',
+      secretKey: 'race-secret-sensitive',
+      passphrase: 'race-passphrase-sensitive'
+    })
+    await controller.connectOkx()
+
+    const createdAt = 1_700_000_000_000
+    const baseEvent = {
+      operation: 'open' as const,
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwejournalrace1',
+      createdAt,
+      intentExpiresAt: createdAt + 10_000
+    }
+    await onMutationLifecycle?.({ ...baseEvent, phase: 'prepared', updatedAt: createdAt })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'transmitting',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+
+    const internals = controller as unknown as {
+      mutationJournal: MutationJournalStore
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    const originalMarkOrderObserved = internals.mutationJournal.markOrderObserved.bind(
+      internals.mutationJournal
+    )
+    let announceTerminalWrite!: () => void
+    let releaseTerminalWrite!: () => void
+    const terminalWriteEntered = new Promise<void>((resolve) => { announceTerminalWrite = resolve })
+    const terminalWriteGate = new Promise<void>((resolve) => { releaseTerminalWrite = resolve })
+    vi.spyOn(internals.mutationJournal, 'markOrderObserved').mockImplementation(async (...args) => {
+      announceTerminalWrite()
+      await terminalWriteGate
+      return originalMarkOrderObserved(...args)
+    })
+
+    const terminalCommit = internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwejournalrace1',
+      ordId: 'journalraceorder1',
+      state: 'filled'
+    })
+    await terminalWriteEntered
+    const lateAck = onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 2,
+      ordId: 'journalraceorder1'
+    })
+    releaseTerminalWrite()
+
+    await expect(Promise.all([terminalCommit, lateAck])).resolves.toEqual([undefined, undefined])
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .not.toContain('重启前订单 mutation')
+    await expect(internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'ETH-USDT-SWAP',
+      clOrdId: 'bwejournalrace1',
+      ordId: 'journalraceorder1',
+      state: 'live'
+    })).rejects.toThrow('已终态合约身份冲突')
+    await expect(internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwejournalrace1',
+      ordId: 'conflictinglatews2',
+      state: 'live'
+    })).rejects.toThrow('已终态交易所订单号冲突')
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('本地订单恢复日志不可用')
+    await controller.dispose()
+  })
+
+  it('retains the pre-ACK terminal record and fails closed on a conflicting late ACK order ID', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-journal-id-race-'))
+    temporaryDirectories.push(userDataDirectory)
+    const recovery = createReadOnlyRecoveryClient()
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await controller.initialize()
+    await controller.saveOkxCredentials({
+      apiKey: 'id-race-api-key-sensitive',
+      secretKey: 'id-race-secret-sensitive',
+      passphrase: 'id-race-passphrase-sensitive'
+    })
+    await controller.connectOkx()
+
+    const createdAt = 1_700_000_000_000
+    const baseEvent = {
+      operation: 'open' as const,
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwejournalidrace1',
+      createdAt,
+      intentExpiresAt: createdAt + 10_000
+    }
+    await onMutationLifecycle?.({ ...baseEvent, phase: 'prepared', updatedAt: createdAt })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'transmitting',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+
+    const internals = controller as unknown as {
+      mutationJournal: MutationJournalStore
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    const originalMarkOrderObserved = internals.mutationJournal.markOrderObserved.bind(
+      internals.mutationJournal
+    )
+    let announceTerminalWrite!: () => void
+    let releaseTerminalWrite!: () => void
+    const terminalWriteEntered = new Promise<void>((resolve) => { announceTerminalWrite = resolve })
+    const terminalWriteGate = new Promise<void>((resolve) => { releaseTerminalWrite = resolve })
+    vi.spyOn(internals.mutationJournal, 'markOrderObserved').mockImplementation(async (...args) => {
+      announceTerminalWrite()
+      await terminalWriteGate
+      return originalMarkOrderObserved(...args)
+    })
+
+    const terminalCommit = internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwejournalidrace1',
+      ordId: 'terminalorderid1',
+      state: 'filled'
+    })
+    await terminalWriteEntered
+    const conflictingAck = onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 2,
+      ordId: 'differentackorder2'
+    })
+    releaseTerminalWrite()
+
+    await expect(terminalCommit).resolves.toBeUndefined()
+    await expect(conflictingAck).rejects.toThrow('本地订单恢复日志写入失败')
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+      expect.objectContaining({
+        clOrdId: 'bwejournalidrace1',
+        ordId: 'terminalorderid1',
+        lifecycleState: 'unknown',
+        reconciliationState: 'matching_order',
+        lastOrderState: 'filled'
+      })
+    ])
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('本地订单恢复日志不可用')
+    await controller.dispose()
+  })
+
+  it('retains a known order ID in a position-effect tombstone and rejects conflicting late evidence', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-position-tombstone-'))
+    temporaryDirectories.push(userDataDirectory)
+    const recovery = createReadOnlyRecoveryClient()
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await controller.initialize()
+    await controller.saveOkxCredentials({
+      apiKey: 'position-tombstone-api-key-sensitive',
+      secretKey: 'position-tombstone-secret-sensitive',
+      passphrase: 'position-tombstone-passphrase-sensitive'
+    })
+    await controller.connectOkx()
+
+    const createdAt = 1_700_000_000_000
+    const baseEvent = {
+      operation: 'open' as const,
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwepositioneffect1',
+      createdAt,
+      intentExpiresAt: createdAt + 10_000
+    }
+    await onMutationLifecycle?.({ ...baseEvent, phase: 'prepared', updatedAt: createdAt })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'transmitting',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 2,
+      ordId: 'positioneffectorder1'
+    })
+    const internals = controller as unknown as {
+      resolveDurableMutation(clientOrderId: string, evidence: 'same_origin_position_effect'): Promise<void>
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    await internals.resolveDurableMutation('bwepositioneffect1', 'same_origin_position_effect')
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+
+    await expect(internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwepositioneffect1',
+      ordId: 'conflictingposition2',
+      state: 'live'
+    })).rejects.toThrow('已终态交易所订单号冲突')
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('本地订单恢复日志不可用')
+    await controller.dispose()
+  })
+
+  it('replays an ordId-only terminal update that arrives before the REST ACK', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-early-terminal-'))
+    temporaryDirectories.push(userDataDirectory)
+    const recovery = createReadOnlyRecoveryClient()
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await controller.initialize()
+    await controller.saveOkxCredentials({
+      apiKey: 'early-api-key-sensitive',
+      secretKey: 'early-secret-sensitive',
+      passphrase: 'early-passphrase-sensitive'
+    })
+    await controller.connectOkx()
+
+    const createdAt = 1_700_000_000_000
+    const baseEvent = {
+      operation: 'close' as const,
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bweearlyterminal1',
+      createdAt,
+      intentExpiresAt: createdAt + 10_000
+    }
+    await onMutationLifecycle?.({ ...baseEvent, phase: 'prepared', updatedAt: createdAt })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'transmitting',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    const internals = controller as unknown as {
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    await internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: '',
+      ordId: 'earlyterminalorder1',
+      state: 'filled'
+    })
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toHaveLength(1)
+
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 2,
+      ordId: 'earlyterminalorder1'
+    })
+
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    await controller.dispose()
+  })
+
+  it('keeps repeated cross-client not-found recovery locked and blocks every conflicting mutation', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-not-found-recovery-'))
+    temporaryDirectories.push(userDataDirectory)
+    const credentials = {
+      apiKey: 'not-found-api-key-sensitive',
+      secretKey: 'not-found-secret-sensitive',
+      passphrase: 'not-found-passphrase-sensitive'
+    }
+    const setup = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await setup.initialize()
+    await setup.saveOkxCredentials(credentials)
+    await seedDurableMutation(userDataDirectory, { phase: 'unknown' })
+
+    const recovery = createReadOnlyRecoveryClient()
+    const restarted = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      now: () => 1_800_000_000_000,
+      createOkxClient: () => recovery.client
+    })
+    await restarted.initialize()
+
+    await expect(restarted.armLiveTrading('确认实盘')).rejects.toThrow('重启前订单 mutation')
+    await expect(restarted.connectOkx()).rejects.toThrow(
+      '新 client 的未找到结果不会自动解除互锁'
+    )
+    await expect(restarted.connectOkx()).rejects.toThrow(
+      '新 client 的未找到结果不会自动解除互锁'
+    )
+    expect(recovery.getOrder).toHaveBeenCalledTimes(2)
+    expect(recovery.createPrivateStream).not.toHaveBeenCalled()
+    expect(recovery.mutationCall).not.toHaveBeenCalled()
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+      expect.objectContaining({
+        lifecycleState: 'unknown',
+        reconciliationState: 'not_found_locked',
+        positionEffectObserved: false
+      })
+    ])
+    await expect(restarted.saveOkxCredentials({
+      apiKey: 'different-api-key-sensitive',
+      secretKey: 'different-secret-sensitive',
+      passphrase: 'different-passphrase-sensitive'
+    })).rejects.toThrow('重启前订单 mutation')
+    await expect(restarted.closePosition({
+      instrumentId: 'BTC-USDT-SWAP',
+      confirmation: '确认平仓'
+    })).rejects.toThrow('重启前订单 mutation')
+    await setup.dispose()
+  })
+
+  it('keeps recovery consistent when terminal evidence wins a concurrent not-found query race', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-recovery-race-'))
+    temporaryDirectories.push(userDataDirectory)
+    const setup = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await setup.initialize()
+    await setup.saveOkxCredentials({
+      apiKey: 'recovery-race-api-key-sensitive',
+      secretKey: 'recovery-race-secret-sensitive',
+      passphrase: 'recovery-race-passphrase-sensitive'
+    })
+    await seedDurableMutation(userDataDirectory, { phase: 'transmitting' })
+
+    const recovery = createReadOnlyRecoveryClient()
+    let announceQuery!: () => void
+    let releaseQuery!: () => void
+    const queryEntered = new Promise<void>((resolve) => { announceQuery = resolve })
+    const queryGate = new Promise<void>((resolve) => { releaseQuery = resolve })
+    recovery.getOrder.mockImplementation(async () => {
+      announceQuery()
+      await queryGate
+      return undefined
+    })
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const restarted = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await restarted.initialize()
+
+    const connecting = restarted.connectOkx()
+    await queryEntered
+    const internals = restarted as unknown as {
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    await internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwerestart1',
+      ordId: 'recoveryraceorder1',
+      state: 'filled'
+    })
+    await onMutationLifecycle?.({
+      phase: 'unknown',
+      operation: 'open',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bwerestart1',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_003,
+      intentExpiresAt: 1_700_000_010_000
+    })
+    releaseQuery()
+
+    await expect(connecting).resolves.toBeUndefined()
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([])
+    expect(recovery.createPrivateStream).toHaveBeenCalledTimes(1)
+    expect(recovery.mutationCall).not.toHaveBeenCalled()
+    await restarted.dispose()
+    await setup.dispose()
+  })
+
+  it('keeps the journal locked when recovered terminal evidence conflicts with immutable identity', async () => {
+    const mismatches = [
+      {
+        suffix: 'instrument',
+        order: {
+          instType: 'SWAP',
+          instId: 'ETH-USDT-SWAP',
+          ordId: '99887766',
+          clOrdId: 'bwerestart1',
+          state: 'filled'
+        } satisfies OkxOrder
+      },
+      {
+        suffix: 'order-id',
+        order: {
+          instType: 'SWAP',
+          instId: 'BTC-USDT-SWAP',
+          ordId: '11223344',
+          clOrdId: 'bwerestart1',
+          state: 'filled'
+        } satisfies OkxOrder
+      }
+    ]
+
+    for (const mismatch of mismatches) {
+      const userDataDirectory = await mkdtemp(
+        path.join(tmpdir(), `bwe-controller-recovery-${mismatch.suffix}-`)
+      )
+      temporaryDirectories.push(userDataDirectory)
+      const setup = new AppController({
+        userDataDirectory,
+        version: 'test',
+        openExternal: async () => undefined
+      })
+      await setup.initialize()
+      await setup.saveOkxCredentials({
+        apiKey: `${mismatch.suffix}-api-key-sensitive`,
+        secretKey: `${mismatch.suffix}-secret-sensitive`,
+        passphrase: `${mismatch.suffix}-passphrase-sensitive`
+      })
+      await seedDurableMutation(userDataDirectory, { phase: 'accepted' })
+      const recovery = createReadOnlyRecoveryClient({ order: mismatch.order })
+      const restarted = new AppController({
+        userDataDirectory,
+        version: 'test',
+        openExternal: async () => undefined,
+        createOkxClient: () => recovery.client
+      })
+      await restarted.initialize()
+
+      await expect(restarted.connectOkx()).rejects.toThrow('身份与 journal 不一致')
+      expect(recovery.createPrivateStream).not.toHaveBeenCalled()
+      expect(recovery.mutationCall).not.toHaveBeenCalled()
+      await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+        expect.objectContaining({
+          instId: 'BTC-USDT-SWAP',
+          ordId: '99887766',
+          clOrdId: 'bwerestart1'
+        })
+      ])
+      await restarted.dispose()
+      await setup.dispose()
+    }
+  })
+
+  it('keeps a recovered partially filled order durable and does not establish a trading connection', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-partial-recovery-'))
+    temporaryDirectories.push(userDataDirectory)
+    const setup = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await setup.initialize()
+    await setup.saveOkxCredentials({
+      apiKey: 'partial-api-key-sensitive',
+      secretKey: 'partial-secret-sensitive',
+      passphrase: 'partial-passphrase-sensitive'
+    })
+    await seedDurableMutation(userDataDirectory, { phase: 'partially_filled' })
+    const pendingOrder: OkxOrder = {
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      ordId: '99887766',
+      clOrdId: 'bwerestart1',
+      state: 'partially_filled',
+      accFillSz: '0.1'
+    }
+    const recovery = createReadOnlyRecoveryClient({ pendingOrders: [pendingOrder] })
+    const restarted = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: () => recovery.client
+    })
+    await restarted.initialize()
+
+    await expect(restarted.connectOkx()).rejects.toThrow('未取得终态')
+
+    expect(recovery.getOrder).not.toHaveBeenCalled()
+    expect(recovery.createPrivateStream).not.toHaveBeenCalled()
+    expect(recovery.mutationCall).not.toHaveBeenCalled()
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+      expect.objectContaining({
+        lifecycleState: 'partially_filled',
+        reconciliationState: 'matching_pending',
+        lastOrderState: 'partially_filled'
+      })
+    ])
+    await restarted.dispose()
+    await setup.dispose()
+  })
+
+  it('refuses recovery with a different account UID before querying the tracked order', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-account-mismatch-'))
+    temporaryDirectories.push(userDataDirectory)
+    const setup = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await setup.initialize()
+    await setup.saveOkxCredentials({
+      apiKey: 'identity-api-key-sensitive',
+      secretKey: 'identity-secret-sensitive',
+      passphrase: 'identity-passphrase-sensitive'
+    })
+    await seedDurableMutation(userDataDirectory, { phase: 'unknown' })
+    const recovery = createReadOnlyRecoveryClient({ uid: 'different-sub-account-uid' })
+    const restarted = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: () => recovery.client
+    })
+    await restarted.initialize()
+
+    await expect(restarted.connectOkx()).rejects.toThrow('子账户与持久化未决订单不匹配')
+    expect(recovery.getOrder).not.toHaveBeenCalled()
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toHaveLength(1)
+    await setup.dispose()
+  })
+
+  it('fails closed on a corrupt startup journal without creating a private client or replacing the file', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-corrupt-journal-'))
+    temporaryDirectories.push(userDataDirectory)
+    const journalPath = path.join(userDataDirectory, MUTATION_JOURNAL_FILE_NAME)
+    const corrupt = '{"version":1,"records":[{"clOrdId":"incomplete"}]}'
+    await writeFile(journalPath, corrupt, 'utf8')
+    const createOkxClient = vi.fn()
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient
+    })
+
+    await controller.initialize()
+
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('订单恢复日志无法验证')
+    await expect(controller.connectOkx()).rejects.toThrow('订单恢复日志无法验证')
+    expect(createOkxClient).not.toHaveBeenCalled()
+    await expect(readFile(journalPath, 'utf8')).resolves.toBe(corrupt)
+    await controller.dispose()
+  })
 })
 
 function healthyVerification(): OkxAccountVerification {
@@ -1232,6 +2203,7 @@ function healthyVerification(): OkxAccountVerification {
       posMode: 'net_mode',
       perm: 'read_only,trade',
       type: '1',
+      uid: 'test-sub-account-uid',
       ip: ''
     },
     checks: {
@@ -1247,6 +2219,109 @@ function healthyVerification(): OkxAccountVerification {
     pendingSwapOrders: [],
     errors: [],
     warnings: []
+  }
+}
+
+async function seedDurableMutation(
+  userDataDirectory: string,
+  options: {
+    phase?: 'prepared' | 'transmitting' | 'accepted' | 'partially_filled' | 'unknown'
+    operation?: 'open' | 'close'
+    uid?: string
+    instId?: string
+    clOrdId?: string
+    ordId?: string
+  } = {}
+): Promise<void> {
+  const phase = options.phase ?? 'transmitting'
+  const operation = options.operation ?? 'open'
+  const instId = options.instId ?? 'BTC-USDT-SWAP'
+  const clOrdId = options.clOrdId ?? 'bwerestart1'
+  const ordId = options.ordId ?? '99887766'
+  const createdAt = 1_700_000_000_000
+  const store = new MutationJournalStore(userDataDirectory)
+  await store.begin({
+    operation,
+    accountFingerprint: createOkxAccountFingerprint(
+      options.uid ?? 'test-sub-account-uid'
+    ),
+    instId,
+    clOrdId,
+    createdAt,
+    intentExpiresAt: createdAt + 10_000
+  })
+  if (phase === 'prepared') return
+  await store.markTransmissionStarted({
+    clOrdId,
+    updatedAt: createdAt + 1,
+    exchangeExpiresAt: createdAt + 5_000
+  })
+  if (phase === 'transmitting') return
+  if (phase === 'unknown') {
+    await store.markUnknown({ clOrdId, updatedAt: createdAt + 2 })
+    return
+  }
+  await store.markAccepted({ clOrdId, ordId, updatedAt: createdAt + 2 })
+  if (phase === 'partially_filled') {
+    await store.markOrderObserved({
+      clOrdId,
+      ordId,
+      orderState: 'partially_filled',
+      pending: true,
+      updatedAt: createdAt + 3
+    })
+  }
+}
+
+function createReadOnlyRecoveryClient(options: {
+  uid?: string
+  order?: OkxOrder
+  positions?: OkxPosition[]
+  pendingOrders?: OkxOrder[]
+} = {}) {
+  let runtimeArmed = false
+  const pendingOrders = options.pendingOrders ?? []
+  const verification = healthyVerification()
+  verification.config.uid = options.uid ?? 'test-sub-account-uid'
+  verification.pendingSwapOrders = structuredClone(pendingOrders)
+  verification.checks.hasNoPendingSwapOrders = pendingOrders.length === 0
+  if (pendingOrders.length > 0) {
+    verification.ok = false
+    verification.errors = ['Dedicated OKX sub-account has unfinished SWAP orders']
+  }
+  const stream = Object.assign(new EventEmitter(), {
+    connect: vi.fn(async () => undefined),
+    disconnect: vi.fn()
+  }) as unknown as OkxPrivateStream
+  const getOrder = vi.fn(async () => options.order ? structuredClone(options.order) : undefined)
+  const getPositions = vi.fn(async () => structuredClone(options.positions ?? []))
+  const createPrivateStream = vi.fn(() => stream)
+  const mutationCall = vi.fn(() => {
+    throw new Error('A recovery test attempted an exchange mutation')
+  })
+  const client = {
+    get restRouteSelection() { return { route: 'direct' as const } },
+    get privateWebSocketRouteSelection() { return { route: 'direct' as const } },
+    get isLiveTradingArmed() { return runtimeArmed },
+    get requiresOrderReconciliation() { return false },
+    verifyAccountConfiguration: vi.fn(async () => structuredClone(verification)),
+    setLiveTradingArmed: vi.fn((armed: boolean) => { runtimeArmed = armed }),
+    getInstruments: vi.fn(async () => []),
+    getPositions,
+    getPendingOrders: vi.fn(async () => structuredClone(pendingOrders)),
+    getPendingAlgoOrders: vi.fn(async () => []),
+    getOrder,
+    createPrivateStream,
+    placeMarketOrder: mutationCall,
+    closeEntirePosition: mutationCall
+  } as unknown as OkxV5Client
+  return {
+    client,
+    stream,
+    getOrder,
+    getPositions,
+    createPrivateStream,
+    mutationCall
   }
 }
 

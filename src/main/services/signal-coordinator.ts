@@ -165,6 +165,84 @@ export class SignalCoordinator {
     }
   }
 
+  /**
+   * Publishes a display-only preview for a message held behind Telegram's
+   * recovery barrier. This deliberately does not consume the message key or
+   * begin AI analysis; canonical FIFO delivery remains the only processing
+   * authority.
+   */
+  async observeRecovered(message: TelegramMessagePayload): Promise<SignalRecord | undefined> {
+    if (!this.accepting || message.recovered !== true) return undefined
+
+    const key = `${message.channelId}:${message.messageId}`
+    if (this.seen.has(key)) return undefined
+    const existing = this.records.get(key)
+    if (existing) {
+      if (existing.telegram.recovered === true) return structuredClone(existing)
+      const next: SignalRecord = {
+        ...existing,
+        telegram: {
+          ...structuredClone(message),
+          recovered: true
+        },
+        updatedAt: this.now()
+      }
+      await this.publish(next)
+      return next
+    }
+
+    const safety = this.dependencies.safety()
+    if (!safety.monitoring || safety.emergencyStopped || safety.positionCloseInProgress) {
+      return undefined
+    }
+
+    const createdAt = this.now()
+    const record: SignalRecord = {
+      id: key,
+      telegram: {
+        ...structuredClone(message),
+        recovered: true
+      },
+      stage: 'received',
+      detail: '收到频道新消息，正在等待 Telegram 连续性校验',
+      createdAt,
+      updatedAt: createdAt
+    }
+    await this.publish(record)
+    return record
+  }
+
+  /**
+   * Terminates display-only recovery previews when their owning monitoring
+   * flow is abandoned. Consuming the message key prevents a late callback
+   * from reviving a message after the user stopped monitoring.
+   */
+  async finalizePendingRecoveryObservations(detail: string): Promise<void> {
+    const pending = [...this.records.values()].filter(
+      (record) =>
+        record.stage === 'received' &&
+        record.telegram.recovered === true &&
+        !this.seen.has(record.id)
+    )
+
+    // Consume the whole batch synchronously before the first publication can
+    // yield. Otherwise a later record could enter canonical processing while
+    // an earlier skipped snapshot is awaiting an asynchronous UI callback.
+    for (const record of pending) this.rememberMessage(record.id)
+
+    let firstError: unknown
+    for (const record of pending) {
+      try {
+        await this.update(record, 'skipped', detail)
+      } catch (error) {
+        // publish() stores the terminal record before notifying listeners. Keep
+        // finalizing the remaining consumed keys even if one UI callback fails.
+        firstError ??= error
+      }
+    }
+    if (firstError !== undefined) throw firstError
+  }
+
   process(
     message: TelegramMessagePayload,
     ingressAuthorization?: SignalTradeAuthorizationToken
@@ -190,6 +268,11 @@ export class SignalCoordinator {
   ): Promise<SignalRecord | undefined> {
     const key = `${message.channelId}:${message.messageId}`
     if (this.seen.has(key)) return undefined
+    const observed = this.records.get(key)
+    message = {
+      ...structuredClone(message),
+      recovered: Boolean(message.recovered || observed?.telegram.recovered)
+    }
     this.rememberMessage(key)
 
     const safety = this.dependencies.safety()
@@ -198,24 +281,43 @@ export class SignalCoordinator {
     // method may begin only after FIFO/setImmediate scheduling, by which point
     // a message received while locked could otherwise be retroactively armed.
     if (!safety.monitoring || safety.emergencyStopped || safety.positionCloseInProgress) {
+      const ignoredRecord = observed
+        ? await this.update(
+            {
+              ...observed,
+              telegram: structuredClone(message)
+            },
+            'skipped',
+            '消息接收后监听或安全状态已变化，未进入 AI 分析'
+          )
+        : undefined
       await this.audit('signal_ignored_monitoring_off', {
         channelId: message.channelId,
         messageId: message.messageId,
         positionCloseInProgress: safety.positionCloseInProgress
       })
-      return undefined
+      return ignoredRecord
     }
 
-    const createdAt = this.now()
-    let record: SignalRecord = {
-      id: key,
-      telegram: structuredClone(message),
-      stage: 'received',
-      detail: '收到频道新消息',
-      createdAt,
-      updatedAt: createdAt
+    const createdAt = observed?.createdAt ?? this.now()
+    let record: SignalRecord
+    if (observed) {
+      record = {
+        ...observed,
+        telegram: structuredClone(message),
+        updatedAt: this.now()
+      }
+    } else {
+      record = {
+        id: key,
+        telegram: structuredClone(message),
+        stage: 'received',
+        detail: '收到频道新消息',
+        createdAt,
+        updatedAt: createdAt
+      }
+      await this.publish(record)
     }
-    await this.publish(record)
 
     // Telegram may replay channel history after a reconnect and assign a fresh
     // local receivedAt. The signed channel publication time is the independent
@@ -247,7 +349,9 @@ export class SignalCoordinator {
       symbols: normalizeSymbols(result.symbols),
       decision: result.decision,
       confidence: clampConfidence(result.confidence),
-      reason: result.reason,
+      reason: result.failureCode === 'quota_exceeded'
+        ? 'ChatGPT 额度已用尽，当前消息未进行 AI 分析'
+        : result.reason,
       latencyMs: result.latencyMs,
       model: result.model ?? undefined
     }
@@ -268,11 +372,17 @@ export class SignalCoordinator {
     }
 
     if (result.status !== 'ok' || result.decision === 'SKIP') {
-      const reason = result.failureCode
-        ? `AI 未给出可执行信号（${failureLabel(result.failureCode)}）：${result.reason}`
-        : `AI 判断不交易：${result.reason}`
+      const reason = result.failureCode === 'quota_exceeded'
+        ? 'ChatGPT 额度已用尽，当前消息无法分析且不会下单；Telegram 监听继续运行并接收频道消息'
+        : result.failureCode
+          ? `AI 未给出可执行信号（${failureLabel(result.failureCode)}）：${result.reason}`
+          : `AI 判断不交易：${result.reason}`
       record = await this.update(record, 'skipped', reason)
-      if (result.failureCode) await this.notice('warning', '本条消息已跳过', reason)
+      // Quota transitions are notified once by AppController. The timeline
+      // retains a per-message explanation without producing a toast storm.
+      if (result.failureCode && result.failureCode !== 'quota_exceeded') {
+        await this.notice('warning', '本条消息已跳过', reason)
+      }
       await this.audit('signal_skipped_by_ai', {
         signalId: record.id,
         failureCode: result.failureCode,
