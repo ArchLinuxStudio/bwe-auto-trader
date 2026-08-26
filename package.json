@@ -1,6 +1,6 @@
 {
   "name": "bwe-auto-trader",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Cross-platform BWEnews signal monitor and OKX trading desktop app",
   "main": "./out/main/index.js",
   "author": "ArchLinuxStudio",

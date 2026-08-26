@@ -268,6 +268,61 @@ describe('MutationJournalStore', () => {
     ])
   })
 
+  it('treats the committed exchange expiry as immutable lifecycle evidence', async () => {
+    const { directory, store } = await createStore()
+    await store.begin(beginInput())
+    await store.markTransmissionStarted({
+      clOrdId: 'bwejournal1',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    await expect(store.markTransmissionStarted({
+      clOrdId: 'bwejournal1',
+      updatedAt: createdAt + 2,
+      exchangeExpiresAt: createdAt + 5_000
+    })).resolves.toEqual([
+      expect.objectContaining({
+        lifecycleState: 'transmitting',
+        exchangeExpiresAt: createdAt + 5_000
+      })
+    ])
+
+    await expect(store.markTransmissionStarted({
+      clOrdId: 'bwejournal1',
+      updatedAt: createdAt + 3,
+      exchangeExpiresAt: createdAt + 6_000
+    })).rejects.toBeInstanceOf(MutationJournalIntegrityError)
+    await expect(store.read()).rejects.toBeInstanceOf(MutationJournalIntegrityError)
+    await expect(new MutationJournalStore(directory).read()).resolves.toEqual([
+      expect.objectContaining({ exchangeExpiresAt: createdAt + 5_000 })
+    ])
+
+    const advanced = await createStore()
+    await advanced.store.begin(beginInput('bweadvancedexpiry'))
+    await advanced.store.markTransmissionStarted({
+      clOrdId: 'bweadvancedexpiry',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    await advanced.store.markAccepted({
+      clOrdId: 'bweadvancedexpiry',
+      updatedAt: createdAt + 2,
+      ordId: 'advancedexpiryorder1'
+    })
+    await expect(advanced.store.markTransmissionStarted({
+      clOrdId: 'bweadvancedexpiry',
+      updatedAt: createdAt + 3,
+      exchangeExpiresAt: createdAt + 5_000
+    })).rejects.toBeInstanceOf(MutationJournalIntegrityError)
+    await expect(new MutationJournalStore(advanced.directory).read()).resolves.toEqual([
+      expect.objectContaining({
+        lifecycleState: 'accepted',
+        ordId: 'advancedexpiryorder1',
+        exchangeExpiresAt: createdAt + 5_000
+      })
+    ])
+  })
+
   it('fails closed on schema-valid fields with contradictory lifecycle evidence', async () => {
     const { directory, store } = await createStore()
     const filePath = path.join(directory, MUTATION_JOURNAL_FILE_NAME)

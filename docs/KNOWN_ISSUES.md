@@ -2,19 +2,41 @@
 
 Only current limitations, reproducible environment problems, and active workarounds belong here. Resolved bugs are retained only in [`DECISIONS.md`](DECISIONS.md) when their lesson constrains future work.
 
+## Telegram low-latency recovery needs real-environment re-verification
+
+Symptoms: In a 2026-08-25 user test of the published `v0.1.7` Windows build, a target-channel post appeared in the signal timeline only after approximately two minutes.
+
+Impact: A fresh announcement can exceed both the desired roughly ten-second receive/analyze window and the trading freshness deadline before the application sees it.
+
+Cause: The tagged implementation checked connection state and generic Telegram authorization every five seconds, but did not compare the target channel's remote message cursor with the locally delivered cursor. This is a confirmed detection gap. The exact private-network or proxy condition that delayed the live push has not been reproduced by automated tests and must not be guessed from local source alone.
+
+Current mitigation in `v0.1.8`: The application performs a four-second-bounded target-channel cursor probe every five seconds. A missed post becomes an immediate no-token recovery preview, then enters the existing complete atomic catch-up and AI path as permanently non-trading. Target-channel, catch-up, authorization, forced-disconnect, and reconnect timeouts fail closed before diagnostics and cannot permanently occupy the health/recovery single-flight; obsolete stopped-client failures are isolated from a later monitor generation. Injected tests show preview and AI start inside the ten-second acceptance window, but do not prove real Telegram or ChatGPT latency.
+
+Next direction: Rebuild and repeat a user-supervised Telegram/ChatGPT-only test after these changes are made available. Measure channel publication, timeline `received`, and AI `analyzing` times without recording credentials, session data, message contents, or personal network details. Keep the issue open unless repeated posts begin analysis in roughly ten seconds or less.
+
+## Dynamic ChatGPT quota refresh needs authenticated verification
+
+Symptoms: `v0.1.8` applies rolling quota notifications and performs a complete bounded read every 60 seconds while authenticated. Injected tests prove timer updates, single-flight behavior, timeout preservation/retry, login/logout lifecycle, exhaustion recovery, and late-close isolation, but no real ChatGPT account was accessed for this change.
+
+Impact: Until a user-authorized real-account check is performed, the live Codex app-server's notification timing and rate-limit snapshot behavior cannot be claimed as integration-verified even though the local scheduling and UI propagation paths pass.
+
+Current workaround: The UI labels the value as updated every minute and retains the last trusted snapshot on a read failure. Treat it as usage guidance rather than a billing or authorization guarantee; the separate fail-closed exhausted state remains the trading authority.
+
+Next direction: Follow the dedicated P1 item in `TODO.md`, observe at least two poll cycles without relogin, and record only non-sensitive results.
+
 ## Cross-client unknown may remain locked indefinitely
 
 Symptoms: If the client that originated an ambiguous mutation is gone—including after process restart—the durable record remains locked when a replacement client sees no matching order. A position effect without an exact matching terminal order is recorded as evidence but also does not release the recovered record. While any recovered record remains unresolved, the explicit connection attempt fails before creating the private WebSocket, so the application does not continuously observe that order's later terminal state.
 
 Impact: Automation can remain safely unavailable until a human establishes the exchange outcome.
 
-Cause: The existing bounded absence rule depends on repeated evidence from the same originating client. The mutation journal preserves identity and expiry evidence, but the accepted cross-client consistency/absence model is not yet complete.
+Cause: The existing bounded absence rule depends on evidence from the same originating client. The accepted cross-client model requires complete order/pending/history/fill evidence, durable client/account/journal revisions, and two consistency barriers. The reviewed OKX API contract does not publish a finite maximum visibility delay or a shared cross-endpoint snapshot revision, so the automatic absence gate intentionally has no enabled value.
 
 Already excluded: One not-found response, a short timer, or credential replacement is not sufficient proof. Those approaches can miss delayed exchange visibility or a late fill.
 
 Current workaround: Do not retry, switch credentials to clear state, edit the journal, or assume absence. Re-run explicit GET-only recovery only with the matching sub-account, verify the outcome in the official OKX client, and remain locked if evidence is absent or conflicts.
 
-Next direction: Specify and test the cross-client evidence model in `TODO.md` before changing release behavior.
+Next direction: Implement the collection-only, recovery-stream portion of the accepted model in `TODO.md`. Negative evidence must remain diagnostic and locked unless `DECISIONS.md` is later updated with an authoritative consistency bound and a durable certificate/tombstone implementation.
 
 ## No real private-service end-to-end verification
 
@@ -24,11 +46,21 @@ Impact: The first real approximately 10 USDT order and close may expose integrat
 
 Current workaround: Only perform a user-authorized, dedicated-sub-account, minimal-fund, actively supervised test while the official OKX client is open. Never use a real private call as an unattended smoke test.
 
-Next direction: Follow the first P1 item in `TODO.md` and record only non-sensitive results.
+Next direction: Follow the corresponding private-service P1 item in `TODO.md` and record only non-sensitive results.
+
+## Packaged tray menu and Explorer cleanup need user verification
+
+Symptoms: The `v0.1.8` isolated packaged portable build passed automated native checks for title-bar close-to-hide, process retention, second-instance restoration, and minimized-window restoration. The automated run did not operate the Explorer tray icon/context menu or observe stale-icon cleanup after the explicit tray quit action.
+
+Impact: The core packaged window lifecycle is verified, but tray icon visibility/activation, the explicit quit menu path, and orphan-icon cleanup still require the user's interactive Windows test. Native tray availability on macOS/Linux also remains unverified.
+
+Current workaround: Keep the main window visible for safety-critical supervision. If a usable tray cannot be created, the implementation deliberately leaves normal Windows/Linux close-to-exit behavior intact so the process cannot become hidden and unreachable.
+
+Next direction: In the published Windows `v0.1.8` package, verify tray icon activation, “显示主窗口”, explicit quit, process exit, and stale-icon cleanup as listed in `TODO.md`.
 
 ## Not suitable for unattended operation
 
-Symptoms: There is no automatic stop loss, take profit, maximum holding time, time-based close, background service, or exit-time close. Emergency stop and application exit do not close an existing position.
+Symptoms: There is no automatic stop loss, take profit, maximum holding time, time-based close, autostart/headless supervision, or exit-time close. Emergency stop and application exit do not close an existing position. Hiding the window to the tray keeps the existing process and live state running; it does not add unattended-operation safeguards.
 
 Impact: Exposure can remain after the application stops or the signal pipeline becomes unavailable.
 
@@ -86,7 +118,7 @@ Symptoms:
 
 - Only text and caption-like message content is analyzed; images, OCR, linked pages, and attachments are not fetched.
 - Standard phone number, code, and 2FA password prompts are implemented. Rare email-code or CAPTCHA flows are not.
-- Monitoring exists only while the application is open and the user starts it.
+- Monitoring exists only while the application process is open and the user starts it; a window hidden to the tray still counts as open.
 
 Impact: Some posts or unusual login flows are safely skipped or fail instead of being analyzed/bypassed.
 

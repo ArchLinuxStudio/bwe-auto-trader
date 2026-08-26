@@ -64,7 +64,7 @@ const EMPTY_SETTINGS: PublicSettings = {
 }
 
 const EMPTY_SNAPSHOT: AppSnapshot = {
-  version: '0.1.7',
+  version: '0.1.8',
   connections: {
     telegram: EMPTY_STATUS,
     chatgpt: EMPTY_STATUS,
@@ -741,6 +741,12 @@ function SettingsView({
     notificationsEnabled: snapshot.settings.notificationsEnabled,
     soundsEnabled: snapshot.settings.soundsEnabled,
   })
+  const aiQuotaUsedPercent = typeof snapshot.aiQuotaPercent === 'number'
+    ? Math.max(0, Math.min(100, snapshot.aiQuotaPercent))
+    : undefined
+  const aiQuotaRemainingPercent = typeof aiQuotaUsedPercent === 'number'
+    ? Math.round(100 - aiQuotaUsedPercent)
+    : undefined
 
   const api = getDesktopApi()
 
@@ -985,13 +991,13 @@ function SettingsView({
                   ? `当前模型：${snapshot.aiModel ?? '自动选择最快可用模型'}`
                   : '不会读取浏览器 Cookie；登录由官方授权页面完成。'}
               </p>
-              {typeof snapshot.aiQuotaPercent === 'number' && (
+              {typeof aiQuotaUsedPercent === 'number' && typeof aiQuotaRemainingPercent === 'number' && (
                 <div className={`quota-row ${snapshot.aiQuotaExhausted ? 'exhausted' : ''}`}>
-                  <div className="quota-track"><span style={{ width: `${Math.min(100, snapshot.aiQuotaPercent)}%` }} /></div>
+                  <div className="quota-track"><span style={{ width: `${aiQuotaRemainingPercent}%` }} /></div>
                   <small>
                     {snapshot.aiQuotaExhausted
                       ? '额度已用尽'
-                      : `本周期已用 ${Math.round(snapshot.aiQuotaPercent)}%`}
+                      : `本周期剩余 ${aiQuotaRemainingPercent}% · 每分钟更新`}
                   </small>
                 </div>
               )}

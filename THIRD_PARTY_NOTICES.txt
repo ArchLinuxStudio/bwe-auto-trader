@@ -1,5 +1,5 @@
 BWE AUTO TRADER - THIRD-PARTY NOTICES
-Version 0.1.7
+Version 0.1.8
 
 This distribution includes the third-party software listed below. Each
 component remains subject to its own license; the BWE Auto Trader LICENSE does
@@ -40,7 +40,7 @@ in LICENSES.chromium.html. That inventory includes weak-copyleft components,
 including FFmpeg under LGPL-2.1-or-later. Consult that HTML file for the exact
 component-by-component terms, notices, and source locations.
 
-This runtime inventory is reviewed for the Windows x64 v0.1.7 artifact only.
+This runtime inventory is reviewed for the Windows x64 v0.1.8 artifact only.
 macOS and Linux public binaries require their own target-specific runtime audit.
 
 Runtime source and build provenance:

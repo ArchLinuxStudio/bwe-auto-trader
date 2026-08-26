@@ -1,33 +1,44 @@
 import path from 'node:path'
+import { Buffer } from 'node:buffer'
 import {
   app,
   BrowserWindow,
   dialog,
+  Menu,
+  nativeImage,
   Notification,
   session,
   shell,
+  Tray,
   type IpcMainInvokeEvent
 } from 'electron'
 import { AppController } from './app-controller'
 import { registerIpcHandlers } from './ipc'
 import { IPC_CHANNELS } from '../shared/ipc-channels'
+import {
+  createTrayMenuTemplate,
+  hideWindowOnClose,
+  revealTrayWindow,
+  ShutdownCoordinator,
+} from './window-tray'
 
 let mainWindow: BrowserWindow | null = null
+let windowCreation: Promise<BrowserWindow> | null = null
+let tray: Tray | null = null
 let controller: AppController | null = null
 let removeIpcHandlers: (() => void) | null = null
-let shutdownStarted = false
+let applicationInitialized = false
+const shutdown = new ShutdownCoordinator()
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) app.quit()
 
 app.on('second-instance', () => {
-  if (!mainWindow) return
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.show()
-  mainWindow.focus()
+  if (!app.isReady()) return
+  requestShowOrCreateMainWindow()
 })
 
-void app.whenReady().then(async () => {
+const startupTask = app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
   app.setAppUserModelId('com.local.bweautotrader')
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
@@ -43,7 +54,7 @@ void app.whenReady().then(async () => {
     })
   })
 
-  controller = new AppController({
+  const nextController = new AppController({
     userDataDirectory: app.getPath('userData'),
     version: app.getVersion(),
     openExternal: openTrustedAuthUrl,
@@ -51,18 +62,27 @@ void app.whenReady().then(async () => {
       if (Notification.isSupported()) new Notification({ title, body, silent: false }).show()
     }
   })
-  await controller.initialize()
+  controller = nextController
+  await nextController.initialize()
+  if (shutdown.started || controller !== nextController) return
   removeIpcHandlers = registerIpcHandlers({
-    controller,
+    controller: nextController,
     isTrustedSender
   })
-  await createWindow()
-  controller.onAppEvent((event) => {
+  const window = await createWindow()
+  if (shutdown.started || controller !== nextController) return
+  nextController.onAppEvent((event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(IPC_CHANNELS.event, event)
     }
   })
-}).catch((error) => {
+  createTray()
+  applicationInitialized = true
+  revealTrayWindow(window)
+})
+
+void startupTask.catch((error) => {
+  if (shutdown.started) return
   // Initialization failures otherwise become silent unhandled rejections in a
   // packaged GUI process. Keep live trading impossible and show a clear dialog.
   const detail = error instanceof Error ? error.message : String(error)
@@ -72,28 +92,55 @@ void app.whenReady().then(async () => {
 })
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) void createWindow()
+  requestShowOrCreateMainWindow()
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // A hidden-to-tray window normally remains alive. If the window is ever
+  // destroyed unexpectedly, keep the tray process available so it can be
+  // recreated by the tray click or platform activate event.
+  if (shutdown.started) return
+  if ((!tray || tray.isDestroyed()) && process.platform !== 'darwin') app.quit()
 })
 
 app.on('before-quit', (event) => {
-  if (shutdownStarted) return
-  shutdownStarted = true
-  event.preventDefault()
-  void (async () => {
+  const initiated = shutdown.handleBeforeQuit(
+    event,
+    async () => {
+      const activeController = controller
+      controller = null
+      await activeController?.dispose()
+    },
+    () => app.quit(),
+    startupTask,
+  )
+  if (!initiated) return
+
+  applicationInitialized = false
+  tray?.destroy()
+  tray = null
+  try {
     removeIpcHandlers?.()
-    removeIpcHandlers = null
-    await controller?.dispose().catch(() => undefined)
-    controller = null
-    app.quit()
-  })()
+  } catch {
+    // Continue disposing the controller even if handler removal fails.
+  }
+  removeIpcHandlers = null
 })
 
-async function createWindow(): Promise<void> {
-  if (mainWindow && !mainWindow.isDestroyed()) return
+async function createWindow(): Promise<BrowserWindow> {
+  if (windowCreation) return windowCreation
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow
+
+  const creation = createWindowInstance()
+  windowCreation = creation
+  try {
+    return await creation
+  } finally {
+    if (windowCreation === creation) windowCreation = null
+  }
+}
+
+async function createWindowInstance(): Promise<BrowserWindow> {
   const window = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -122,15 +169,72 @@ async function createWindow(): Promise<void> {
     if (url !== window.webContents.getURL()) event.preventDefault()
   })
   window.webContents.on('will-attach-webview', (event) => event.preventDefault())
-  window.once('ready-to-show', () => window.show())
+  window.on('close', (event) => {
+    hideWindowOnClose(
+      event,
+      window,
+      shutdown.started,
+      Boolean(tray && !tray.isDestroyed()),
+    )
+  })
   window.on('closed', () => {
     if (mainWindow === window) mainWindow = null
   })
 
-  const rendererUrl = process.env.ELECTRON_RENDERER_URL
-  if (rendererUrl) await window.loadURL(rendererUrl)
-  else await window.loadFile(path.join(__dirname, '../renderer/index.html'))
+  try {
+    const rendererUrl = process.env.ELECTRON_RENDERER_URL
+    if (rendererUrl) await window.loadURL(rendererUrl)
+    else await window.loadFile(path.join(__dirname, '../renderer/index.html'))
+  } catch (error) {
+    if (!window.isDestroyed()) window.destroy()
+    if (mainWindow === window) mainWindow = null
+    throw error
+  }
+  return window
 }
+
+async function showOrCreateMainWindow(): Promise<void> {
+  if (!applicationInitialized || shutdown.started) return
+  const window = await createWindow()
+  if (shutdown.started) return
+  revealTrayWindow(window)
+}
+
+function requestShowOrCreateMainWindow(): void {
+  void showOrCreateMainWindow().catch(() => {
+    dialog.showErrorBox('BWE Auto Trader', '无法恢复主窗口，请从托盘菜单退出并重启程序。')
+  })
+}
+
+function createTray(): boolean {
+  if (tray && !tray.isDestroyed()) return true
+  let nextTray: Tray | null = null
+  try {
+    const icon = nativeImage.createFromBuffer(Buffer.from(TRAY_ICON_PNG_BASE64, 'base64'))
+    if (icon.isEmpty()) return false
+    if (process.platform === 'darwin') icon.setTemplateImage(true)
+
+    nextTray = new Tray(icon)
+    nextTray.setToolTip('BWE Auto Trader')
+    nextTray.setContextMenu(Menu.buildFromTemplate(createTrayMenuTemplate(
+      requestShowOrCreateMainWindow,
+      () => app.quit(),
+    )))
+    nextTray.on('click', requestShowOrCreateMainWindow)
+    tray = nextTray
+    return true
+  } catch {
+    nextTray?.destroy()
+    tray = null
+    return false
+  }
+}
+
+// A compact transparent 32px application glyph keeps tray behavior independent
+// of platform packaging resources, which currently still use Electron's default
+// unsigned application icon.
+const TRAY_ICON_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAnUlEQVR42u2XsQ2AMAwE07EQDSXrsSEbMAFtaBFF8Nvv5IWw5DZ3SmzLKeUPIJZ9q5YcBqaLPA+c1tmUFBEPuCWSBj/qyZVA4W8CsARy7VaBuwQdTpUYKhCBWwWaEmjhyQlYxUICUXhXAfoTMOBuARacUoTRdkwV6NKGEXjaNKTAJQQ8E5EKRxYSD5y2FaXCJZZSibVc4mMi8zX7dFxmzm+M0aNOZQAAAABJRU5ErkJggg=='
 
 function isTrustedSender(event: IpcMainInvokeEvent): boolean {
   const frame = event.senderFrame

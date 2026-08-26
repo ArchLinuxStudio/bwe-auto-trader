@@ -788,7 +788,7 @@ describe('live trading interlock', () => {
       if (url.pathname === '/api/v5/trade/orders-pending') {
         return okJson([
           {
-            instType: 'SWAP', instId: 'BTC-USDT-SWAP', ordId: 'pending-1',
+            instType: 'SWAP', instId: 'BTC-USDT-SWAP', ordId: 'pending1',
             clOrdId: 'manual1', state: 'live'
           }
         ])
@@ -824,7 +824,7 @@ describe('live trading interlock', () => {
           ? okJson([])
           : okJson([
               {
-                instType: 'SWAP', instId: 'ETH-USDT-SWAP', ordId: 'pending-2',
+                instType: 'SWAP', instId: 'ETH-USDT-SWAP', ordId: 'pending2',
                 clOrdId: 'manual2', state: 'partially_filled'
               }
             ])
@@ -1616,7 +1616,7 @@ describe('live trading interlock', () => {
         expect(url.searchParams.get('clOrdId')).toBe(unknownError.clOrdId)
         return okJson([
           {
-            instType: 'SWAP', instId: 'BTC-USDT-SWAP', ordId: 'found-1',
+            instType: 'SWAP', instId: 'BTC-USDT-SWAP', ordId: 'found1',
             clOrdId: unknownError.clOrdId, state: 'filled'
           }
         ])
@@ -1641,7 +1641,7 @@ describe('live trading interlock', () => {
     const reconciliation = await client.reconcileUnknownOrder(unknownError)
     expect(reconciliation).toMatchObject({
       safeToClear: true,
-      order: { ordId: 'found-1', state: 'filled' },
+      order: { ordId: 'found1', state: 'filled' },
       positions: []
     })
     expect(client.requiresOrderReconciliation).toBe(true)
@@ -1685,6 +1685,347 @@ describe('live trading interlock', () => {
     })
     client.confirmOrderReconciled()
     expect(client.requiresOrderReconciliation).toBe(false)
+  })
+
+  it('keeps the unknown interlock when exact order details are malformed after the absence window', async () => {
+    let now = 1_754_960_400_000
+    let unknown!: OkxOrderStateUnknownError
+    const { client } = createTradingHarness({
+      now: () => now,
+      onOrder: (_url, init) => {
+        if (init?.method === 'POST') throw new Error('socket closed after write')
+        return okJson([{
+          instType: 'SWAP',
+          instId: 'ETH-USDT-SWAP',
+          ordId: 'conflictingorder',
+          clOrdId: unknown.clOrdId,
+          state: 'filled'
+        }])
+      }
+    })
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+    unknown = await client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: client.armNextLiveTrade('open')
+    }).catch((caught: unknown) => caught) as OkxOrderStateUnknownError
+
+    now += 30_000
+    await expect(client.reconcileUnknownOrder(unknown)).rejects.toMatchObject({
+      code: 'INVALID_ORDER_DETAILS'
+    })
+    expect(() => client.confirmOrderReconciled()).toThrow('not been safely reconciled')
+  })
+
+  it('keeps the unknown interlock when the pending-order snapshot is malformed or incomplete', async () => {
+    let now = 1_754_960_400_000
+    let submissionFailed = false
+    const { client } = createTradingHarness({
+      now: () => now,
+      onPendingOrders: (url) => {
+        expect(url.searchParams.get('limit')).toBe('100')
+        return submissionFailed
+          ? okJson([{
+              instType: 'SWAP',
+              instId: 'not-an-instrument',
+              ordId: 'malformedpendingorder',
+              clOrdId: 'malformedpending',
+              state: 'mystery'
+            }])
+          : okJson([])
+      },
+      onOrder: (_url, init) => {
+        if (init?.method === 'POST') {
+          submissionFailed = true
+          throw new Error('socket closed after write')
+        }
+        return new Response(
+          JSON.stringify({ code: '51603', msg: 'Order does not exist', data: [] }),
+          { status: 200 }
+        )
+      }
+    })
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+    const unknown = await client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: client.armNextLiveTrade('open')
+    }).catch((caught: unknown) => caught) as OkxOrderStateUnknownError
+
+    now += 30_000
+    await expect(client.reconcileUnknownOrder(unknown)).rejects.toMatchObject({
+      code: 'INVALID_PENDING_ORDER'
+    })
+    expect(() => client.confirmOrderReconciled()).toThrow('not been safely reconciled')
+  })
+
+  it('keeps an unknown close interlocked when position evidence is malformed', async () => {
+    let submitted = false
+    const { client } = createTradingHarness({
+      onPositions: () => okJson([{
+        instType: 'SWAP',
+        instId: 'BTC-USDT-SWAP',
+        posSide: 'net',
+        pos: submitted ? '0x0' : '2',
+        mgnMode: 'isolated'
+      }]),
+      onOrder: (_url, init) => {
+        if (init?.method === 'POST') {
+          submitted = true
+          throw new Error('socket closed after write')
+        }
+        return new Response(
+          JSON.stringify({ code: '51603', msg: 'Order does not exist', data: [] }),
+          { status: 200 }
+        )
+      }
+    })
+    client.setLiveTradingArmed(true)
+    const unknown = await client.closeEntirePosition({
+      instId: 'BTC-USDT-SWAP',
+      arm: client.armNextLiveTrade('close')
+    }).catch((caught: unknown) => caught) as OkxOrderStateUnknownError
+
+    await expect(client.reconcileUnknownOrder(unknown)).rejects.toMatchObject({
+      code: 'INVALID_SWAP_POSITION'
+    })
+    expect(() => client.confirmOrderReconciled()).toThrow('not been safely reconciled')
+  })
+
+  it('refuses to treat a full ordinary pending-order page as complete', async () => {
+    const pending = Array.from({ length: 100 }, (_, index) => ({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      ordId: `pendingorder${index}`,
+      clOrdId: `pendingclient${index}`,
+      state: 'live'
+    }))
+    const { client } = createTradingHarness({
+      onPendingOrders: () => okJson(pending)
+    })
+
+    await expect(client.verifyAccountConfiguration()).rejects.toThrow(
+      'at least 100 pending SWAP orders'
+    )
+  })
+
+  it('fails closed on malformed positions before an opening order can reach POST', async () => {
+    const malformedPositions = [
+      {
+        instType: 'SWAP', instId: 'BTC-USDT-SWAP', posSide: 'net',
+        pos: '0x0', mgnMode: 'isolated'
+      },
+      {
+        instType: 'SWAP', instId: 'BTC-USDT-SWAP', posSide: 'hedged',
+        pos: '0', mgnMode: 'isolated'
+      },
+      {
+        instType: 'SWAP', instId: 'BTC-USDT-SWAP', posSide: 'net',
+        pos: '0', mgnMode: 'portfolio'
+      },
+      {
+        instType: 'SWAP', instId: 'not-an-instrument', posSide: 'net',
+        pos: '0', mgnMode: 'isolated'
+      }
+    ]
+
+    for (const malformed of malformedPositions) {
+      const { client, fetchImpl } = createTradingHarness({
+        onPositions: () => okJson([malformed])
+      })
+      await client.verifyAccountConfiguration()
+      client.setLiveTradingArmed(true)
+
+      await expect(client.placeMarketOrder({
+        symbolOrInstId: 'BTC',
+        direction: 'LONG',
+        arm: client.armNextLiveTrade('open')
+      })).rejects.toMatchObject({ code: 'INVALID_SWAP_POSITION' })
+      expect(fetchImpl.mock.calls.some(([input, init]) =>
+        new URL(input).pathname === '/api/v5/trade/order' && init?.method === 'POST'
+      )).toBe(false)
+    }
+  })
+
+  it('does not collapse a mathematically non-zero position through floating-point underflow', async () => {
+    const { client, fetchImpl } = createTradingHarness({
+      onPositions: () => okJson([{
+        instType: 'SWAP',
+        instId: 'BTC-USDT-SWAP',
+        posSide: 'net',
+        pos: '1e-999',
+        mgnMode: 'isolated'
+      }])
+    })
+    await client.verifyAccountConfiguration()
+    client.setLiveTradingArmed(true)
+
+    await expect(client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: client.armNextLiveTrade('open')
+    })).rejects.toThrow('already has an open position')
+    expect(fetchImpl.mock.calls.some(([input, init]) =>
+      new URL(input).pathname === '/api/v5/trade/order' && init?.method === 'POST'
+    )).toBe(false)
+  })
+
+  it('keeps an unknown close interlocked for a non-zero position below Number range', async () => {
+    let submitted = false
+    const { client } = createTradingHarness({
+      onPositions: () => okJson([{
+        instType: 'SWAP',
+        instId: 'BTC-USDT-SWAP',
+        posSide: 'net',
+        pos: submitted ? '1e-999' : '2',
+        mgnMode: 'isolated'
+      }]),
+      onOrder: (_url, init) => {
+        if (init?.method === 'POST') {
+          submitted = true
+          throw new Error('socket closed after write')
+        }
+        return new Response(
+          JSON.stringify({ code: '51603', msg: 'Order does not exist', data: [] }),
+          { status: 200 }
+        )
+      }
+    })
+    client.setLiveTradingArmed(true)
+    const unknown = await client.closeEntirePosition({
+      instId: 'BTC-USDT-SWAP',
+      arm: client.armNextLiveTrade('close')
+    }).catch((caught: unknown) => caught) as OkxOrderStateUnknownError
+
+    await expect(client.reconcileUnknownOrder(unknown)).resolves.toMatchObject({
+      safeToClear: false,
+      positions: [{ pos: '1e-999' }]
+    })
+    expect(() => client.confirmOrderReconciled()).toThrow('not been safely reconciled')
+  })
+
+  it('rejects scoped position and pending-order responses for another instrument', async () => {
+    let positionSubmissionFailed = false
+    const positionHarness = createTradingHarness({
+      onPositions: () => positionSubmissionFailed
+        ? okJson([{
+            instType: 'SWAP',
+            instId: 'ETH-USDT-SWAP',
+            posSide: 'net',
+            pos: '0',
+            mgnMode: 'isolated'
+          }])
+        : okJson([]),
+      onOrder: (_url, init) => {
+        if (init?.method === 'POST') {
+          positionSubmissionFailed = true
+          throw new Error('socket closed after write')
+        }
+        return new Response(
+          JSON.stringify({ code: '51603', msg: 'Order does not exist', data: [] }),
+          { status: 200 }
+        )
+      }
+    })
+    await positionHarness.client.verifyAccountConfiguration()
+    positionHarness.client.setLiveTradingArmed(true)
+    const positionUnknown = await positionHarness.client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: positionHarness.client.armNextLiveTrade('open')
+    }).catch((caught: unknown) => caught) as OkxOrderStateUnknownError
+    await expect(positionHarness.client.reconcileUnknownOrder(positionUnknown)).rejects.toMatchObject({
+      code: 'INVALID_SWAP_POSITION'
+    })
+
+    let pendingSubmissionFailed = false
+    const pendingHarness = createTradingHarness({
+      onPendingOrders: () => pendingSubmissionFailed
+        ? okJson([{
+            instType: 'SWAP',
+            instId: 'ETH-USDT-SWAP',
+            ordId: 'wronginstrumentorder1',
+            clOrdId: 'wronginstrumentclient1',
+            state: 'live'
+          }])
+        : okJson([]),
+      onOrder: (_url, init) => {
+        if (init?.method === 'POST') {
+          pendingSubmissionFailed = true
+          throw new Error('socket closed after write')
+        }
+        return new Response(
+          JSON.stringify({ code: '51603', msg: 'Order does not exist', data: [] }),
+          { status: 200 }
+        )
+      }
+    })
+    await pendingHarness.client.verifyAccountConfiguration()
+    pendingHarness.client.setLiveTradingArmed(true)
+    const pendingUnknown = await pendingHarness.client.placeMarketOrder({
+      symbolOrInstId: 'BTC',
+      direction: 'LONG',
+      arm: pendingHarness.client.armNextLiveTrade('open')
+    }).catch((caught: unknown) => caught) as OkxOrderStateUnknownError
+    await expect(pendingHarness.client.reconcileUnknownOrder(pendingUnknown)).rejects.toMatchObject({
+      code: 'INVALID_PENDING_ORDER'
+    })
+  })
+
+  it('rejects undocumented rejected and failed normal-order states', async () => {
+    for (const state of ['rejected', 'failed']) {
+      const { client } = createTradingHarness({
+        onOrder: (_url, init) => {
+          expect(init?.method).toBe('GET')
+          return okJson([{
+            instType: 'SWAP',
+            instId: 'BTC-USDT-SWAP',
+            ordId: 'unsupportedstateorder1',
+            clOrdId: 'unsupportedstateclient1',
+            state
+          }])
+        }
+      })
+      await expect(client.getOrder({
+        instId: 'BTC-USDT-SWAP',
+        clOrdId: 'unsupportedstateclient1'
+      })).rejects.toMatchObject({ code: 'INVALID_ORDER_DETAILS' })
+    }
+  })
+
+  it('accepts legal empty client IDs from external pending and ordId queries', async () => {
+    const pendingHarness = createTradingHarness({
+      onPendingOrders: () => okJson([{
+        instType: 'SWAP',
+        instId: 'BTC-USDT-SWAP',
+        ordId: 'externalpending1',
+        clOrdId: '',
+        state: 'partially_filled'
+      }])
+    })
+    await expect(pendingHarness.client.verifyAccountConfiguration()).resolves.toMatchObject({
+      ok: false,
+      pendingSwapOrders: [{ ordId: 'externalpending1', clOrdId: '' }]
+    })
+
+    const detailHarness = createTradingHarness({
+      onOrder: (_url, init) => {
+        expect(init?.method).toBe('GET')
+        return okJson([{
+          instType: 'SWAP',
+          instId: 'BTC-USDT-SWAP',
+          ordId: 'externaldetail1',
+          clOrdId: '',
+          state: 'filled'
+        }])
+      }
+    })
+    await expect(detailHarness.client.getOrder({
+      instId: 'BTC-USDT-SWAP',
+      ordId: 'externaldetail1'
+    })).resolves.toMatchObject({ ordId: 'externaldetail1', clOrdId: '' })
   })
 })
 
@@ -1785,6 +2126,47 @@ describe('full-position reduce-only close', () => {
     }
   })
 
+  it('uses lexical position sign and a trimmed unsigned size for reduce-only close', async () => {
+    const cases = [
+      { position: ' +1e-999 ', expectedSide: 'sell' },
+      { position: ' -1e-999 ', expectedSide: 'buy' }
+    ] as const
+
+    for (const testCase of cases) {
+      let submittedBody!: Record<string, unknown>
+      const { client } = createTradingHarness({
+        onPositions: () => okJson([{
+          instType: 'SWAP',
+          instId: 'BTC-USDT-SWAP',
+          posSide: 'net',
+          pos: testCase.position,
+          mgnMode: 'isolated'
+        }]),
+        onOrder: (_url, init, body) => {
+          expect(init?.method).toBe('POST')
+          submittedBody = body
+          return okJson([{
+            ordId: 'lexicalcloseorder1',
+            clOrdId: body.clOrdId,
+            sCode: '0',
+            sMsg: ''
+          }])
+        }
+      })
+      client.setLiveTradingArmed(true)
+
+      await expect(client.closeEntirePosition({
+        instId: 'BTC-USDT-SWAP',
+        arm: client.armNextLiveTrade('close')
+      })).resolves.toMatchObject({ closedSize: '1e-999' })
+      expect(submittedBody).toMatchObject({
+        side: testCase.expectedSide,
+        sz: '1e-999',
+        reduceOnly: true
+      })
+    }
+  })
+
   it('interlocks an ambiguous reduce-only close and requires matching-order reconciliation', async () => {
     const { client } = createTradingHarness({
       onPositions: () => okJson([
@@ -1835,8 +2217,8 @@ describe('full-position reduce-only close', () => {
         {
           instType: 'SWAP',
           instId: 'BTC-USDT-SWAP',
-          ordId: 'pending-close',
-          clOrdId: 'manual-close',
+          ordId: 'pendingclose',
+          clOrdId: 'manualclose',
           state: 'live'
         }
       ])
@@ -1912,8 +2294,8 @@ describe('full-position reduce-only close', () => {
         {
           instType: 'SWAP',
           instId: 'ETH-USDT-SWAP',
-          ordId: 'other-order',
-          clOrdId: 'other-client-order',
+          ordId: 'otherorder',
+          clOrdId: 'otherclientorder',
           state: 'live'
         }
       ]),

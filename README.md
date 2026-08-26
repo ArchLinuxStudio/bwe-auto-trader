@@ -9,10 +9,10 @@
 
 ## 当前范围
 
-- Windows / macOS / Linux 源码与构建脚本（Electron + React + TypeScript）；`0.1.7` 已在 Windows x64 生成 NSIS 安装包和便携 ZIP，并完成 afterPack、ZIP 完整解压及便携版隔离冷启动验证；macOS/Linux 仍需对应系统或 CI 验证
-- Telegram 本人账号通过固定版本的 `teleproto` 连接 MTProto；现有加密 GramJS StringSession 可直接迁移。健康连接下新消息会立即显示并开始 AI 分析；若消息正被启动/重连连续性校验暂存，界面也会先立即显示“等待校验”，确认补拉顺序后才开始 AI。若监听或连接在确认前停止，卡片会结束为“已跳过”，不会永久等待；这类恢复消息永远不会触发下单
+- Windows / macOS / Linux 源码与构建脚本（Electron + React + TypeScript）；`0.1.8` 在 Windows x64 提供 NSIS 安装包和便携 ZIP，并完成 afterPack、ZIP 完整解压及便携版隔离冷启动验证；macOS/Linux 仍需对应系统或 CI 验证
+- Telegram 本人账号通过固定版本的 `teleproto` 连接 MTProto；现有加密 GramJS StringSession 可直接迁移。健康连接下实时推送会立即显示并开始 AI 分析；程序还会每 5 秒核对一次目标频道游标，实时推送漏失时先以“等待校验”显示，确认完整补拉顺序后开始 AI。若监听或连接在确认前停止，卡片会结束为“已跳过”，不会永久等待；启动、重连或游标探测补到的消息永远不会触发下单
 - Telegram 与 ChatGPT 使用 Clash Party（默认 `127.0.0.1:7890`）
-- ChatGPT Plus 官方 Codex 登录，10 秒超时即 `SKIP`；额度耗尽时会明确提示并锁定自动下单，但 Telegram 监听和频道消息接收继续运行，每条消息仍会显示为“未分析、未下单”
+- ChatGPT Plus 官方 Codex 登录，10 秒超时即 `SKIP`；登录期间接收官方额度通知并每 60 秒完整刷新一次，界面显示本周期剩余额度。额度读取暂时失败时保留上次可信值；额度耗尽会明确提示并锁定自动下单，但 Telegram 监听和频道消息接收继续运行，每条消息仍会显示为“未分析、未下单”
 - OKX REST 与私有 WebSocket 分别直连优先；直连失败时为本次连接固定使用应用内 Clash。连接时校验 Read + Trade、独立子账户、net 模式，以及普通挂单和 8 类未触发策略委托
 - 程序不包含任何提现接口；若 OKX 返回 `Withdraw` 权限，只显示安全提醒，不再阻止连接
 - USDT 永续、逐仓、单向、1x、每单 10 USDT、最多 1 仓、同币 60 分钟冷却
@@ -20,8 +20,12 @@
 - REST 下单成功仅表示 OKX 已受理；成交、部分成交、撤单以私有订单流或只读对账为准
 - 网络超时、网关异常或回包不完整时按唯一 `clOrdId` 锁定并只读对账，绝不自动重发
 - 系统安全存储、审计日志、桌面通知、紧急停止、重启自动锁定实盘
+- 点击主窗口右上角 `X` 会隐藏到系统托盘；单击托盘图标或选择“显示主窗口”可恢复，选择“退出 BWE Auto Trader”才会结束进程
 
 首版不包含止损、止盈、超时平仓、链接或图片内容分析。应用退出不会自动平仓。
+
+> [!IMPORTANT]
+> 隐藏到托盘不等于停止程序。Telegram 监听、已连接服务和已解锁的实盘能力会继续运行。需要禁止新开仓时请先使用“紧急停止”；需要结束程序时请从托盘菜单显式退出。无论隐藏还是退出，都不会自动平掉已有 OKX 仓位。
 
 ## 开发
 
@@ -79,7 +83,7 @@ npm.cmd run package:mac
 npm.cmd run package:linux
 ```
 
-macOS 和 Linux 安装包应分别在对应系统或 CI runner 上生成。当前 `0.1.7` Windows 安装包和主程序未配置发布者代码签名，Windows SmartScreen 可能警告；长期正式分发建议配置 Windows 代码签名，macOS 则需 Developer ID 签名与公证。
+macOS 和 Linux 安装包应分别在对应系统或 CI runner 上生成。当前 `0.1.8` Windows 安装包和主程序未配置发布者代码签名，Windows SmartScreen 可能警告；长期正式分发建议配置 Windows 代码签名，macOS 则需 Developer ID 签名与公证。
 
 ## 测试安全说明
 

@@ -1599,6 +1599,71 @@ describe('AppController OKX route integration', () => {
     await controller.dispose()
   })
 
+  it('fails closed on an undocumented normal-order state from durable evidence', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-order-state-'))
+    temporaryDirectories.push(userDataDirectory)
+    const recovery = createReadOnlyRecoveryClient()
+    let onMutationLifecycle: OkxClientOptions['onMutationLifecycle']
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined,
+      createOkxClient: (options) => {
+        onMutationLifecycle = options.onMutationLifecycle
+        return recovery.client
+      }
+    })
+    await controller.initialize()
+    await controller.saveOkxCredentials({
+      apiKey: 'state-api-key-sensitive',
+      secretKey: 'state-secret-sensitive',
+      passphrase: 'state-passphrase-sensitive'
+    })
+    await controller.connectOkx()
+
+    const createdAt = 1_700_000_000_000
+    const baseEvent = {
+      operation: 'open' as const,
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bweunsupportedstate1',
+      createdAt,
+      intentExpiresAt: createdAt + 10_000
+    }
+    await onMutationLifecycle?.({ ...baseEvent, phase: 'prepared', updatedAt: createdAt })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'transmitting',
+      updatedAt: createdAt + 1,
+      exchangeExpiresAt: createdAt + 5_000
+    })
+    await onMutationLifecycle?.({
+      ...baseEvent,
+      phase: 'accepted',
+      updatedAt: createdAt + 2,
+      ordId: 'unsupportedstateorder1'
+    })
+
+    const internals = controller as unknown as {
+      persistDurableOrderEvidence(order: OkxOrderUpdate): Promise<void>
+    }
+    await expect(internals.persistDurableOrderEvidence({
+      instType: 'SWAP',
+      instId: 'BTC-USDT-SWAP',
+      clOrdId: 'bweunsupportedstate1',
+      ordId: 'unsupportedstateorder1',
+      state: 'rejected'
+    })).rejects.toThrow('缺少可验证状态')
+    expect(controller.getSnapshot().safety.armBlockers.join('；'))
+      .toContain('本地订单恢复日志不可用')
+    await expect(new MutationJournalStore(userDataDirectory).read()).resolves.toEqual([
+      expect.objectContaining({
+        lifecycleState: 'accepted',
+        ordId: 'unsupportedstateorder1'
+      })
+    ])
+    await controller.dispose()
+  })
+
   it('serializes a concurrent terminal journal commit ahead of a late ACK', async () => {
     const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-journal-race-'))
     temporaryDirectories.push(userDataDirectory)

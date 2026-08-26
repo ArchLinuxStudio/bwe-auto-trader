@@ -26,6 +26,9 @@ interface TelegramMonitorHarness {
     recovered: boolean
   }>
   disconnectedChecks: number
+  startupBaselineId: number
+  lastSeenMessageId: number
+  stopRequested: boolean
   reconnecting: boolean
   recoveryPending: boolean
   recoveryFromMessageId?: number
@@ -36,6 +39,7 @@ interface TelegramMonitorHarness {
     connected: boolean
     getMessages: (...args: unknown[]) => Promise<unknown[]>
     connect?: () => Promise<void>
+    disconnect?: () => Promise<void>
     checkAuthorization?: () => Promise<boolean>
     addEventHandler?: (...args: unknown[]) => void
     destroy?: () => Promise<void>
@@ -48,6 +52,8 @@ interface TelegramMonitorHarness {
   handleNewMessageEvent(event: unknown): Promise<void>
   catchUpMessages(fromMessageId?: number): Promise<void>
   healthCheck(): Promise<void>
+  startHealthTimer(): void
+  clearHealthTimer(): void
   installConnectionStateHandler(client: unknown): void
   connectionEventHandler?: (event: unknown) => void
 }
@@ -61,7 +67,11 @@ function createMonitor(
   onStatus?: (status: TelegramStatusEvent) => void | Promise<void>,
   monitorOptions: Partial<Pick<
     TelegramMonitorOptions,
-    'catchUpLimit' | 'healthCheckIntervalMs' | 'stopDrainTimeoutMs' | 'captureAuthorization'
+    | 'catchUpLimit'
+    | 'healthCheckIntervalMs'
+    | 'healthProbeTimeoutMs'
+    | 'stopDrainTimeoutMs'
+    | 'captureAuthorization'
   >> = {},
   onMessageObserved?: (message: TelegramSignalMessage) => void | Promise<void>,
 ): { monitor: TelegramMonitor; harness: TelegramMonitorHarness } {
@@ -294,6 +304,366 @@ describe('TelegramMonitor message dispatch', () => {
     })
   })
 
+  it('detects a missed target-channel push within the default five-second poll', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+    vi.setSystemTime(new Date('2026-08-26T01:00:00.000Z'))
+    let releaseCatchUp!: (messages: unknown[]) => void
+    const catchUp = new Promise<unknown[]>((resolve) => {
+      releaseCatchUp = resolve
+    })
+    const observed: TelegramSignalMessage[] = []
+    const delivered: TelegramSignalMessage[] = []
+    const dispatchTokens: Array<SignalTradeAuthorizationToken | undefined> = []
+    const statuses: string[] = []
+    const authorizationToken: SignalTradeAuthorizationToken = {
+      capability: {},
+      armRevision: 1,
+      monitoringRevision: 1,
+      telegramLifecycleRevision: 1,
+      telegramRecoveryRevision: 0,
+      telegramMonitor: {},
+    }
+    const missedMessage = {
+      id: 101,
+      message: 'low-latency cursor recovery',
+      date: Math.floor(Date.now() / 1_000),
+    }
+    const getMessages = vi
+      .fn()
+      .mockResolvedValueOnce([missedMessage])
+      .mockImplementationOnce(() => catchUp)
+    const client = {
+      connected: true,
+      getMessages,
+      checkAuthorization: vi.fn(async () => true),
+    }
+    const aiStartedAt: number[] = []
+    const analyze = vi.fn(async () => {
+      aiStartedAt.push(Date.now())
+      return {
+        symbols: ['ABC'],
+        decision: 'LONG' as const,
+        confidence: 0.9,
+        reason: 'listing',
+        status: 'ok' as const,
+        model: 'test-fast',
+        latencyMs: 1,
+        analyzedAt: new Date(Date.now()).toISOString(),
+      }
+    })
+    const openTrade = vi.fn(async () => ({
+      instrumentId: 'ABC-USDT-SWAP',
+      orderId: 'order-1',
+      clientOrderId: 'client-1',
+    }))
+    const coordinator = new SignalCoordinator({
+      now: () => Date.now(),
+      settings: () => ({
+        channelUsername: 'BWEnews',
+        orderNotionalUsdt: 10,
+        leverage: 1,
+        cooldownMinutes: 60,
+        aiTimeoutMs: 10_000,
+        maxConcurrentPositions: 1,
+        marginMode: 'isolated',
+        positionMode: 'net',
+      }),
+      safety: () => ({
+        monitoring: true,
+        liveArmed: true,
+        authorizationToken,
+        okxConnected: true,
+        emergencyStopped: false,
+        positionCloseInProgress: false,
+      }),
+      analyze,
+      readPositions: async () => [],
+      openTrade,
+      onRecord: () => undefined,
+    })
+    const { harness } = createMonitor(
+      async (message, context) => {
+        delivered.push(message)
+        dispatchTokens.push(context.authorizationToken)
+        await coordinator.process(
+          toTelegramMessagePayload(message),
+          context.authorizationToken,
+        )
+      },
+      undefined,
+      (status) => {
+        statuses.push(status.state)
+      },
+      { captureAuthorization: () => authorizationToken },
+      (message) => {
+        observed.push(message)
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.startupBaselineId = 100
+    harness.lastSeenMessageId = 100
+    harness.client = client
+
+    harness.startHealthTimer()
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(getMessages).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.waitFor(() => expect(observed).toHaveLength(1))
+    expect(delivered).toEqual([])
+    expect(observed[0]).toMatchObject({
+      messageId: 101,
+      text: 'low-latency cursor recovery',
+      receivedAt: '2026-08-26T01:00:05.000Z',
+      recovered: true,
+    })
+
+    releaseCatchUp([missedMessage])
+    await vi.waitFor(() => expect(analyze).toHaveBeenCalledOnce())
+    harness.clearHealthTimer()
+
+    expect(getMessages).toHaveBeenCalledTimes(2)
+    expect(getMessages).toHaveBeenNthCalledWith(1, harness.channelEntity, { limit: 1 })
+    expect(getMessages).toHaveBeenNthCalledWith(2, harness.channelEntity, {
+      limit: 100,
+      minId: 100,
+      reverse: true,
+    })
+    expect(client.checkAuthorization).toHaveBeenCalledOnce()
+    expect(delivered[0]).toMatchObject({
+      messageId: 101,
+      text: 'low-latency cursor recovery',
+      receivedAt: '2026-08-26T01:00:05.000Z',
+      recovered: true,
+    })
+    expect(statuses).toEqual([])
+    expect(harness.liveTradingReadiness.ready).toBe(true)
+    expect(aiStartedAt).toHaveLength(1)
+    const aiDelayMs = aiStartedAt[0]! - Date.parse('2026-08-26T01:00:00.000Z')
+    expect(aiDelayMs).toBeGreaterThanOrEqual(5_000)
+    expect(aiDelayMs).toBeLessThanOrEqual(10_000)
+    expect(dispatchTokens).toEqual([undefined])
+    expect(openTrade).not.toHaveBeenCalled()
+  })
+
+  it('merges a multi-message cursor gap with a residual live update in FIFO order', async () => {
+    let releaseCatchUp!: (messages: unknown[]) => void
+    const catchUp = new Promise<unknown[]>((resolve) => {
+      releaseCatchUp = resolve
+    })
+    const publishedAt = Math.floor(Date.now() / 1_000)
+    const messages = [101, 102, 103, 104].map((id) => ({
+      id,
+      message: `message-${id}`,
+      date: publishedAt,
+    }))
+    const observed: number[] = []
+    const delivered: TelegramSignalMessage[] = []
+    const getMessages = vi
+      .fn()
+      .mockResolvedValueOnce([messages[2]])
+      .mockImplementationOnce(() => catchUp)
+    const { harness } = createMonitor(
+      (message) => {
+        delivered.push(message)
+      },
+      undefined,
+      undefined,
+      {},
+      (message) => {
+        observed.push(message.messageId)
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.startupBaselineId = 100
+    harness.lastSeenMessageId = 100
+    harness.client = {
+      connected: true,
+      getMessages,
+      checkAuthorization: vi.fn(async () => true),
+    }
+
+    const health = harness.healthCheck()
+    await vi.waitFor(() => expect(getMessages).toHaveBeenCalledTimes(2))
+    await harness.handleNewMessageEvent({ message: messages[3] })
+    await flushMessageDispatches()
+    expect(observed).toEqual([103, 104])
+
+    releaseCatchUp([messages[2], messages[0], messages[1]])
+    await health
+    await flushMessageDispatches()
+
+    expect(delivered.map((message) => message.messageId)).toEqual([101, 102, 103, 104])
+    expect(delivered.every((message) => message.recovered)).toBe(true)
+  })
+
+  it('bounds a stalled target-channel health probe', async () => {
+    vi.useFakeTimers()
+    const errors: string[] = []
+    const never = new Promise<unknown[]>(() => undefined)
+    const neverReports = new Promise<void>(() => undefined)
+    const { harness } = createMonitor(
+      () => undefined,
+      async (error) => {
+        errors.push(error.message)
+        await neverReports
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = {
+      connected: true,
+      getMessages: vi.fn(() => never),
+      checkAuthorization: vi.fn(async () => true),
+    }
+
+    const health = harness.healthCheck()
+    await vi.advanceTimersByTimeAsync(3_999)
+    expect(harness.recoveryPending).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    await health
+
+    expect(errors).toEqual(['Telegram target-channel health probe timed out'])
+    expect(harness.recoveryPending).toBe(true)
+    expect(harness.liveTradingReadiness.ready).toBe(false)
+  })
+
+  it('rebuilds a ghost connection after a target-channel probe timeout', async () => {
+    vi.useFakeTimers()
+    const never = new Promise<unknown[]>(() => undefined)
+    const getMessages = vi.fn().mockImplementationOnce(() => never).mockResolvedValueOnce([])
+    const client = {
+      connected: true,
+      getMessages,
+      checkAuthorization: vi.fn(async () => true),
+      disconnect: vi.fn(async () => {
+        client.connected = false
+      }),
+      connect: vi.fn(async () => {
+        client.connected = true
+      }),
+    }
+    const { harness } = createMonitor(
+      () => undefined,
+      undefined,
+      undefined,
+      { healthProbeTimeoutMs: 4_000 },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = client
+
+    const stalledHealth = harness.healthCheck()
+    await vi.advanceTimersByTimeAsync(4_000)
+    await stalledHealth
+    expect(harness.recoveryPending).toBe(true)
+
+    await harness.healthCheck()
+
+    expect(client.disconnect).toHaveBeenCalledOnce()
+    expect(client.connect).toHaveBeenCalledOnce()
+    expect(getMessages).toHaveBeenCalledTimes(2)
+    expect(client.checkAuthorization).toHaveBeenCalledOnce()
+    expect(harness.recoveryPending).toBe(false)
+    expect(harness.liveTradingReadiness.ready).toBe(true)
+  })
+
+  it.each(['catch-up page', 'recovery authorization'] as const)(
+    'bounds a stalled %s request and keeps the recovery gate closed',
+    async (stage) => {
+      vi.useFakeTimers()
+      const errors: string[] = []
+      const missedMessage = {
+        id: 101,
+        message: 'bounded recovery request',
+        date: Math.floor(Date.now() / 1_000),
+      }
+      const neverMessages = new Promise<unknown[]>(() => undefined)
+      const neverAuthorization = new Promise<boolean>(() => undefined)
+      const getMessages = stage === 'catch-up page'
+        ? vi.fn().mockResolvedValueOnce([missedMessage]).mockImplementationOnce(() => neverMessages)
+        : vi.fn().mockResolvedValueOnce([missedMessage]).mockResolvedValueOnce([missedMessage])
+      const checkAuthorization = stage === 'recovery authorization'
+        ? vi.fn(() => neverAuthorization)
+        : vi.fn(async () => true)
+      const { harness } = createMonitor(
+        () => undefined,
+        (error) => {
+          errors.push(error.message)
+        },
+      )
+      harness.stateValue = 'connected'
+      harness.channelEntity = {}
+      harness.startupBaselineId = 100
+      harness.lastSeenMessageId = 100
+      harness.client = {
+        connected: true,
+        getMessages,
+        checkAuthorization,
+      }
+
+      const health = harness.healthCheck()
+      if (stage === 'catch-up page') {
+        await vi.waitFor(() => expect(getMessages).toHaveBeenCalledTimes(2))
+      } else {
+        await vi.waitFor(() => expect(checkAuthorization).toHaveBeenCalledOnce())
+      }
+      await vi.advanceTimersByTimeAsync(4_000)
+      await health
+
+      expect(errors).toContain(
+        stage === 'catch-up page'
+          ? 'Telegram catch-up page timed out'
+          : 'Telegram recovery authorization probe timed out',
+      )
+      expect(harness.recoveryPromise).toBeUndefined()
+      expect(harness.recoveryPending).toBe(true)
+      expect(harness.liveTradingReadiness.ready).toBe(false)
+    },
+  )
+
+  it.each(['disconnect', 'connect'] as const)(
+    'bounds a stalled forced %s lifecycle step',
+    async (stage) => {
+      vi.useFakeTimers()
+      const neverMessages = new Promise<unknown[]>(() => undefined)
+      const neverLifecycle = new Promise<void>(() => undefined)
+      const client = {
+        connected: true,
+        getMessages: vi.fn().mockImplementationOnce(() => neverMessages).mockResolvedValue([]),
+        checkAuthorization: vi.fn(async () => true),
+        disconnect: vi.fn(async () => {
+          if (stage === 'disconnect') await neverLifecycle
+          client.connected = false
+        }),
+        connect: vi.fn(async () => {
+          if (stage === 'connect') await neverLifecycle
+          client.connected = true
+        }),
+      }
+      const { harness } = createMonitor(() => undefined)
+      harness.stateValue = 'connected'
+      harness.channelEntity = {}
+      harness.client = client
+
+      const stalledProbe = harness.healthCheck()
+      await vi.advanceTimersByTimeAsync(4_000)
+      await stalledProbe
+
+      const recovery = harness.healthCheck()
+      await vi.advanceTimersByTimeAsync(4_000)
+      await recovery
+
+      expect(client.disconnect).toHaveBeenCalledOnce()
+      expect(client.connect).toHaveBeenCalledTimes(stage === 'connect' ? 1 : 0)
+      expect(harness.recoveryPromise).toBeUndefined()
+      expect(harness.recoveryPending).toBe(true)
+      expect(harness.liveTradingReadiness.ready).toBe(false)
+    },
+  )
+
   it('debounces one disconnected sample and recovers the queued message without publishing reconnecting', async () => {
     const delivered: TelegramSignalMessage[] = []
     const statuses: string[] = []
@@ -337,7 +707,7 @@ describe('TelegramMonitor message dispatch', () => {
     expect(delivered[0]?.messageId).toBe(88)
     expect(delivered[0]?.recovered).toBe(true)
     expect(statuses).toEqual([])
-    expect(client.checkAuthorization).toHaveBeenCalledTimes(2)
+    expect(client.checkAuthorization).toHaveBeenCalledOnce()
   })
 
   it('shows a recovery-buffered live update before catch-up settles and dispatches it only once', async () => {
@@ -474,7 +844,7 @@ describe('TelegramMonitor message dispatch', () => {
     await harness.healthCheck()
 
     expect(client.connect).toHaveBeenCalledOnce()
-    expect(client.checkAuthorization).toHaveBeenCalledTimes(2)
+    expect(client.checkAuthorization).toHaveBeenCalledOnce()
     expect(statuses).toEqual(['reconnecting', 'connected'])
     expect(harness.disconnectedChecks).toBe(0)
     expect(harness.reconnecting).toBe(false)
@@ -691,17 +1061,17 @@ describe('TelegramMonitor message dispatch', () => {
     expect(harness.liveTradingReadiness.ready).toBe(true)
   })
 
-  it('does not let a pending authorization probe block the confirmation deadline', async () => {
+  it('does not let a pending target-channel probe block the confirmation deadline', async () => {
     vi.useFakeTimers()
-    let resolveAuthorization!: (authorized: boolean) => void
-    const authorization = new Promise<boolean>((resolve) => {
-      resolveAuthorization = resolve
+    let resolveProbe!: (messages: unknown[]) => void
+    const probe = new Promise<unknown[]>((resolve) => {
+      resolveProbe = resolve
     })
     const statuses: string[] = []
     const client = {
       connected: true,
-      getMessages: vi.fn(async () => []),
-      checkAuthorization: vi.fn(() => authorization),
+      getMessages: vi.fn(() => probe),
+      checkAuthorization: vi.fn(async () => true),
       addEventHandler: vi.fn(),
     }
     const { harness } = createMonitor(
@@ -726,24 +1096,26 @@ describe('TelegramMonitor message dispatch', () => {
 
     expect(statuses).toEqual(['reconnecting'])
     expect(harness.liveTradingReadiness.ready).toBe(false)
-    resolveAuthorization(false)
+    resolveProbe([])
     await health
   })
 
-  it('ignores a stale authorization result after a newer recovery succeeds', async () => {
-    let resolveOldProbe!: (authorized: boolean) => void
-    const oldProbe = new Promise<boolean>((resolve) => {
+  it('ignores a stale target-channel probe after a newer recovery succeeds', async () => {
+    let resolveOldProbe!: (messages: unknown[]) => void
+    const oldProbe = new Promise<unknown[]>((resolve) => {
       resolveOldProbe = resolve
     })
+    const staleMessage = {
+      id: 999,
+      message: 'stale probe must not reopen recovery',
+      date: Math.floor(Date.now() / 1_000),
+    }
+    const observed: number[] = []
     const statuses: string[] = []
     const client = {
       connected: true,
-      getMessages: vi.fn(async () => []),
-      checkAuthorization: vi
-        .fn()
-        .mockImplementationOnce(() => oldProbe)
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true),
+      getMessages: vi.fn().mockImplementationOnce(() => oldProbe).mockResolvedValue([]),
+      checkAuthorization: vi.fn(async () => true),
       addEventHandler: vi.fn(),
     }
     const { harness } = createMonitor(
@@ -751,6 +1123,10 @@ describe('TelegramMonitor message dispatch', () => {
       undefined,
       (status) => {
         statuses.push(status.state)
+      },
+      {},
+      (message) => {
+        observed.push(message.messageId)
       },
     )
     harness.stateValue = 'connected'
@@ -769,11 +1145,69 @@ describe('TelegramMonitor message dispatch', () => {
     await harness.recoveryPromise
     expect(harness.liveTradingReadiness.ready).toBe(true)
 
-    resolveOldProbe(false)
+    resolveOldProbe([staleMessage])
     await oldHealth
+    await flushMessageDispatches()
     expect(harness.recoveryPending).toBe(false)
     expect(harness.disconnectedChecks).toBe(0)
+    expect(client.getMessages).toHaveBeenCalledTimes(2)
+    expect(observed).toEqual([])
     expect(statuses).toEqual([])
+  })
+
+  it('isolates a late recovery failure from a new monitor generation after bounded stop', async () => {
+    let rejectCatchUp!: (error: Error) => void
+    const catchUp = new Promise<unknown[]>((_resolve, reject) => {
+      rejectCatchUp = reject
+    })
+    const statuses: string[] = []
+    const { monitor, harness } = createMonitor(
+      () => undefined,
+      undefined,
+      (status) => {
+        statuses.push(status.state)
+      },
+      { stopDrainTimeoutMs: 20 },
+    )
+    const oldClient = {
+      connected: true,
+      getMessages: vi.fn(() => catchUp),
+      checkAuthorization: vi.fn(async () => true),
+      destroy: vi.fn(async () => undefined),
+    }
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = oldClient
+    harness.recoveryPending = true
+    harness.recoveryFromMessageId = 0
+
+    const oldHealth = harness.healthCheck()
+    await vi.waitFor(() => expect(oldClient.getMessages).toHaveBeenCalledOnce())
+    await monitor.stop()
+
+    const newClient = {
+      connected: true,
+      getMessages: vi.fn(async () => []),
+      checkAuthorization: vi.fn(async () => true),
+    }
+    harness.stopRequested = false
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = newClient
+    const statusesBeforeLateFailure = statuses.length
+
+    // stop() must detach the old health single-flight even if its bounded
+    // drain returned before the obsolete recovery settled.
+    await harness.healthCheck()
+    expect(newClient.getMessages).toHaveBeenCalledOnce()
+
+    rejectCatchUp(new Error('obsolete recovery failed late'))
+    await oldHealth
+
+    expect(harness.stateValue).toBe('connected')
+    expect(harness.recoveryPending).toBe(false)
+    expect(harness.disconnectedChecks).toBe(0)
+    expect(statuses.slice(statusesBeforeLateFailure)).toEqual([])
   })
 
   it('bounds stop even when a message callback never settles', async () => {

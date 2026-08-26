@@ -166,6 +166,306 @@ describe('ChatGptService', () => {
     })
   })
 
+  it('refreshes authenticated rate limits every minute and stops after close', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = configuredTransport()
+      let usedPercent = 10
+      let readCount = 0
+      transport.handle('account/rateLimits/read', () => {
+        readCount += 1
+        return { rateLimits: { secondary: { usedPercent } } }
+      })
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 60_000,
+        rateLimitsReadTimeoutMs: 5_000,
+      })
+
+      await service.start()
+      expect(readCount).toBe(1)
+      expect(service.getStatus().rateLimits).toMatchObject({
+        rateLimits: { secondary: { usedPercent: 10 } },
+      })
+
+      usedPercent = 35
+      await vi.advanceTimersByTimeAsync(59_999)
+      expect(readCount).toBe(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(readCount).toBe(2)
+      expect(service.getStatus().rateLimits).toMatchObject({
+        rateLimits: { secondary: { usedPercent: 35 } },
+      })
+
+      await service.close()
+      expect(service.getStatus()).toMatchObject({
+        initialized: false,
+        authenticated: false,
+        rateLimits: null,
+      })
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(readCount).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the last trusted limits after a timed-out poll and retries on schedule', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = configuredTransport()
+      const pendingPoll = deferred<unknown>()
+      let readCount = 0
+      transport.handle('account/rateLimits/read', () => {
+        readCount += 1
+        if (readCount === 1) return { rateLimits: { secondary: { usedPercent: 10 } } }
+        if (readCount === 2) return pendingPoll.promise
+        return { rateLimits: { secondary: { usedPercent: 40 } } }
+      })
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 100,
+      })
+
+      await service.start()
+      await vi.advanceTimersByTimeAsync(100)
+      expect(readCount).toBe(2)
+
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(readCount).toBe(2)
+      expect(service.getStatus()).toMatchObject({
+        rateLimits: { rateLimits: { secondary: { usedPercent: 10 } } },
+        lastError: null,
+      })
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(readCount).toBe(2)
+      expect(service.getStatus()).toMatchObject({
+        rateLimits: { rateLimits: { secondary: { usedPercent: 10 } } },
+        lastError: null,
+      })
+
+      await vi.advanceTimersByTimeAsync(100)
+      expect(readCount).toBe(3)
+      expect(service.getStatus().rateLimits).toMatchObject({
+        rateLimits: { secondary: { usedPercent: 40 } },
+      })
+      await service.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shares one in-flight rate-limit read across timer and explicit refresh triggers', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = configuredTransport()
+      const pendingPoll = deferred<unknown>()
+      let readCount = 0
+      transport.handle('account/rateLimits/read', () => {
+        readCount += 1
+        if (readCount === 1) return { rateLimits: { secondary: { usedPercent: 10 } } }
+        if (readCount === 2) return pendingPoll.promise
+        throw new Error(`Unexpected overlapping rate-limit read ${readCount}`)
+      })
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 100,
+        rateLimitsReadTimeoutMs: 10_000,
+      })
+
+      await service.start()
+      await vi.advanceTimersByTimeAsync(100)
+      expect(readCount).toBe(2)
+
+      const explicitRead = service.readRateLimits()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(readCount).toBe(2)
+      expect(service.getStatus()).toMatchObject({
+        rateLimits: { rateLimits: { secondary: { usedPercent: 10 } } },
+        lastError: null,
+      })
+
+      pendingPoll.resolve({ rateLimits: { secondary: { usedPercent: 40 } } })
+      await vi.advanceTimersByTimeAsync(0)
+      await expect(explicitRead).resolves.toMatchObject({
+        rateLimits: { secondary: { usedPercent: 40 } },
+      })
+      expect(readCount).toBe(2)
+      expect(service.getStatus().rateLimits).toMatchObject({
+        rateLimits: { secondary: { usedPercent: 40 } },
+      })
+      await service.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('pauses periodic rate-limit reads as soon as logout begins', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = configuredTransport()
+      const pendingLogout = deferred<unknown>()
+      let readCount = 0
+      transport.handle('account/rateLimits/read', () => {
+        readCount += 1
+        return { rateLimits: { secondary: { usedPercent: 10 } } }
+      })
+      transport.handle('account/logout', () => pendingLogout.promise)
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 100,
+      })
+
+      await service.start()
+      const logout = service.logout()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(readCount).toBe(1)
+
+      pendingLogout.resolve({})
+      await logout
+      await vi.advanceTimersByTimeAsync(500)
+      expect(readCount).toBe(1)
+      expect(service.getStatus()).toMatchObject({
+        authenticated: false,
+        rateLimits: null,
+      })
+      await service.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('discards a periodic read that completes after the service closes', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = configuredTransport()
+      const pendingPoll = deferred<unknown>()
+      let readCount = 0
+      transport.handle('account/rateLimits/read', () => {
+        readCount += 1
+        if (readCount === 1) return { rateLimits: { secondary: { usedPercent: 10 } } }
+        if (readCount === 2) return pendingPoll.promise
+        throw new Error(`Unexpected rate-limit read ${readCount}`)
+      })
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 100,
+        rateLimitsReadTimeoutMs: 10_000,
+      })
+
+      await service.start()
+      await vi.advanceTimersByTimeAsync(100)
+      expect(readCount).toBe(2)
+
+      await service.close()
+      pendingPoll.resolve({ rateLimits: { secondary: { usedPercent: 90 } } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(service.getStatus()).toMatchObject({
+        initialized: false,
+        authenticated: false,
+        rateLimits: null,
+        quotaExhausted: false,
+      })
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(readCount).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('detects quota recovery on the timer without a message or notification', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = configuredTransport()
+      let readCount = 0
+      transport.handle('account/rateLimits/read', () => {
+        readCount += 1
+        return {
+          rateLimits: {
+            secondary: { usedPercent: readCount === 1 ? 100 : 30 },
+          },
+        }
+      })
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 60_000,
+      })
+
+      await service.start()
+      expect(service.getStatus().quotaExhausted).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(readCount).toBe(2)
+      expect(service.getStatus()).toMatchObject({
+        quotaExhausted: false,
+        rateLimits: { rateLimits: { secondary: { usedPercent: 30 } } },
+      })
+      await service.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('starts periodic rate-limit reads after a new login becomes authenticated', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = new MockTransport()
+      let authenticated = false
+      let rateLimitReadCount = 0
+      transport.handle('initialize', () => ({}))
+      transport.handle('account/read', () => ({
+        account: authenticated
+          ? { type: 'chatgpt', email: 'plus@example.com', planType: 'plus' }
+          : null,
+        requiresOpenaiAuth: true,
+      }))
+      transport.handle('account/login/start', () => ({
+        type: 'chatgpt',
+        loginId: 'periodic-login',
+        authUrl: 'https://chatgpt.com/auth',
+      }))
+      transport.handle('model/list', () => ({
+        data: [{ model: 'classifier-mini', supportedReasoningEfforts: [{ reasoningEffort: 'none' }] }],
+        nextCursor: null,
+      }))
+      transport.handle('account/rateLimits/read', () => {
+        rateLimitReadCount += 1
+        return { rateLimits: { secondary: { usedPercent: rateLimitReadCount * 10 } } }
+      })
+      transport.handle('thread/start', () => ({ thread: { id: 'thread-after-periodic-login' } }))
+      const service = new ChatGptService({
+        transport,
+        rateLimitsPollIntervalMs: 100,
+      })
+
+      await service.start()
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(rateLimitReadCount).toBe(0)
+
+      const login = await service.startBrowserLogin()
+      const completion = service.waitForLogin(login.loginId)
+      authenticated = true
+      transport.emit('account/login/completed', {
+        loginId: login.loginId,
+        success: true,
+        error: null,
+      })
+      await completion
+      expect(rateLimitReadCount).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(100)
+      expect(rateLimitReadCount).toBe(2)
+      expect(service.getStatus().rateLimits).toMatchObject({
+        rateLimits: { secondary: { usedPercent: 20 } },
+      })
+      await service.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('returns a strict structured signal and never exposes an order action', async () => {
     const transport = configuredTransport()
     transport.handle('turn/start', () => {
@@ -493,14 +793,14 @@ describe('ChatGptService', () => {
     stalePublicRead.resolve({
       rateLimits: { secondary: { usedPercent: 10 } },
     })
-    await expect(publicRead).resolves.toMatchObject({
-      rateLimits: { secondary: { usedPercent: 100 } },
-    })
     await vi.waitFor(() => expect(readCount).toBe(3))
     expect(service.getStatus().quotaExhausted).toBe(true)
     expect(observedQuotaStates).not.toContain(false)
 
     latestRefresh.resolve({
+      rateLimits: { secondary: { usedPercent: 100 } },
+    })
+    await expect(publicRead).resolves.toMatchObject({
       rateLimits: { secondary: { usedPercent: 100 } },
     })
     await vi.waitFor(() => expect(service.getStatus().rateLimits).toMatchObject({

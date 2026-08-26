@@ -138,9 +138,12 @@ class AsyncLifecycleMutex {
 const TERMINAL_OKX_ORDER_STATES = new Set([
   'filled',
   'canceled',
-  'rejected',
-  'failed',
   'mmp_canceled'
+])
+const OBSERVABLE_OKX_ORDER_STATES = new Set([
+  'live',
+  'partially_filled',
+  ...TERMINAL_OKX_ORDER_STATES
 ])
 const EARLY_CLOSE_ORDER_UPDATE_LIMIT = 200
 const FINALIZED_CLOSE_ORDER_KEY_LIMIT = 200
@@ -2734,7 +2737,10 @@ function cleanOkxValue(value: string | undefined): string | undefined {
 
 function normalizeOkxOrderState(value: string | undefined): string | undefined {
   const state = cleanOkxValue(value)?.toLowerCase()
-  return state === 'cancelled' ? 'canceled' : state
+  const normalized = state === 'cancelled' ? 'canceled' : state
+  return normalized && OBSERVABLE_OKX_ORDER_STATES.has(normalized)
+    ? normalized
+    : undefined
 }
 
 function positiveNumber(value: string | undefined): number {

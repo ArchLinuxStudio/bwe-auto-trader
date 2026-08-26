@@ -297,6 +297,19 @@ export class MutationJournalStore {
 
   async markTransmissionStarted(input: MarkTransmissionInput): Promise<DurableMutationRecord[]> {
     return this.updateRecord(input.clOrdId, (record) => {
+      if (!['prepared', 'transmitting'].includes(record.lifecycleState)) {
+        throw new MutationJournalIntegrityError(
+          'A durable mutation cannot return to the transmitting phase'
+        )
+      }
+      if (
+        record.exchangeExpiresAt !== undefined &&
+        record.exchangeExpiresAt !== input.exchangeExpiresAt
+      ) {
+        throw new MutationJournalIntegrityError(
+          'The durable mutation received conflicting exchange expiry evidence'
+        )
+      }
       record.updatedAt = nextTimestamp(record, input.updatedAt)
       record.exchangeExpiresAt = input.exchangeExpiresAt
       if (record.lifecycleState === 'prepared') record.lifecycleState = 'transmitting'

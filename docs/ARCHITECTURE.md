@@ -43,7 +43,8 @@ The renderer has no Node integration or direct network authority. UI disabled st
 
 | Path | Responsibility |
 |---|---|
-| `src/main/index.ts` | Electron lifecycle, single-instance behavior, window hardening, CSP, trusted external URLs, IPC installation, and orderly shutdown |
+| `src/main/index.ts` | Electron lifecycle, single-instance/tray behavior, window hardening, CSP, trusted external URLs, IPC installation, and orderly shutdown |
+| `src/main/window-tray.ts` | Pure hide/reveal helpers, stable tray-menu actions, and the asynchronous shutdown coordinator |
 | `src/main/ipc.ts` | Trusted renderer validation, IPC argument schemas, public error compression, and the controller facade |
 | `src/main/app-controller.ts` | Global connection/safety state machine, lifecycle mutex, credentials boundary, live capability, positions, manual close, reconciliation, notifications, and snapshots |
 | `src/main/services/telegram.ts` | teleproto login, Clash transport, channel resolution, startup baseline, cursor recovery, buffering, connection health, and message-time authorization capture |
@@ -72,13 +73,16 @@ The renderer has no Node integration or direct network authority. UI disabled st
 - An explicit OKX connection first matches the journal's hashed account UID, then performs GET-only recovery. A recovered new client never applies the originating client's timed absence rule.
 - `AppController` serializes OKX credential, account, and trading lifecycle operations with a FIFO mutex. Safety actions can revoke capability synchronously before awaited audit or UI work.
 - Snapshots are emitted from the main process and contain only public state.
+- Once startup is complete and a usable native tray exists, a title-bar close hides the existing main window instead of destroying it. Tray activation, the show menu item, a second instance, and macOS activation all restore or recreate the same main window path.
+- Hiding is not a service-lifecycle event: the controller, manually started monitoring, connections, and any current live authorization continue unchanged. Only explicit application quit starts IPC removal and controller disposal; repeated quit requests remain blocked until that asynchronous cleanup finishes.
+- If a usable tray cannot be created, Windows/Linux retain normal close-to-exit behavior so the application cannot become unreachable. Native tray behavior is a platform-specific integration and does not transfer release verification between operating systems.
 
 ## Signal-to-order data flow
 
 1. The user manually connects all services, starts monitoring, and enters the exact live confirmation phrase.
 2. The raw teleproto `NewMessage` handler synchronously captures the current process-local authorization token before FIFO or asynchronous dispatch.
-3. Telegram validates channel/message data, deduplicates it, and queues it. Startup/reconnect catch-up messages carry `recovered=true` permanently.
-4. If a raw live update is held behind startup/recovery verification, Telegram emits a separate no-token, `recovered=true` observation after it is successfully buffered. `SignalCoordinator` may publish only a `received` record for immediate renderer visibility; this path neither starts AI nor consumes canonical message state.
+3. Telegram validates channel/message data, deduplicates it, and queues it. A bounded five-second target-channel cursor probe independently detects a post that the live update stream did not deliver. Startup/reconnect/cursor-gap catch-up messages carry `recovered=true` permanently.
+4. If a raw live update or cursor-probe result is held behind startup/recovery verification, Telegram emits a separate no-token, `recovered=true` observation after it is successfully buffered. `SignalCoordinator` may publish only a `received` record for immediate renderer visibility; this path neither starts AI nor consumes canonical message state.
 5. After the normal FIFO handoff, `SignalCoordinator` creates or reuses the record and asks `ChatGptService` for a strictly structured classification. A long-lived process-local Codex thread, created with `ephemeral=true`, is reused to serialize analyses during that service lifetime.
 6. After each asynchronous boundary, the coordinator rechecks message age, monitoring, recovery state, live authorization generations, OKX connectivity, close/pending interlocks, cooldown, and positions.
 7. `AppController` asks `OkxV5Client` to prepare an order, then mints a one-use open capability only after read-only checks.
@@ -86,17 +90,20 @@ The renderer has no Node integration or direct network authority. UI disabled st
 9. A successful REST acknowledgement becomes pending confirmation, not a fill. Private order updates or read-only reconciliation determine fill, cancellation, rejection, or unknown state.
 10. `AppController` emits a new `AppSnapshot`; the renderer only displays it.
 
-ChatGPT quota exhaustion is an analysis-capacity state, not a Telegram transport failure. The main process revokes the live-trading capability and blocks re-arming, emits one explicit transition notification, and keeps monitoring available. Each later channel message remains visible and terminates as `SKIP` without crossing the OKX order boundary. Known exhaustion blocks new classifier turns; if newer exhaustion evidence arrives during an older turn, that result is also reduced to a quota `SKIP`. Sparse updates, failed reads, superseded reads, and older successful turns cannot clear exhaustion. Quota `SKIP` handling may start a non-blocking, single-flight, throttled full read so recovery does not depend on receiving a rolling notification. Only a full rate-limit read started after the latest evidence may restore analysis readiness, and it never restores live authorization; the user must explicitly arm again.
+ChatGPT quota exhaustion is an analysis-capacity state, not a Telegram transport failure. While the main-process service is initialized and ChatGPT-authenticated, rolling app-server notifications update quota state immediately and a recursive 60-second timer performs a complete rate-limit read with a 10-second request deadline. Periodic, explicit, notification-recovery, and quota-`SKIP` refresh triggers share one single-flight request. A timeout or latest-revision read failure preserves the last trusted value and retries on a later cycle; logout pauses polling before its RPC, and service close cancels future scheduling and rejects late state commits. The main process revokes the live-trading capability and blocks re-arming, emits one explicit exhaustion-transition notification, and keeps Telegram monitoring available. Each later channel message remains visible and terminates as `SKIP` without crossing the OKX order boundary. Known exhaustion blocks new classifier turns; if newer exhaustion evidence arrives during an older turn, that result is also reduced to a quota `SKIP`. Sparse updates, failed reads, superseded reads, and older successful turns cannot clear exhaustion. Only a successful full rate-limit read begun for the latest account/evidence revision may restore analysis readiness, and it never restores live authorization; the user must explicitly arm again.
 
 ## Telegram recovery model
 
 The application, not teleproto, owns reconnect sequencing. Library auto-reconnect is disabled.
 
 - A suspected connection failure immediately closes internal readiness, so no message can gain trade authority during validation.
+- While connected, a target-channel `getMessages(limit=1)` probe runs every five seconds with a four-second deadline. A generic authorization probe is not sufficient because it can succeed while a channel push is delayed. If the remote cursor is newer than the local cursor, the returned candidate is immediately buffered/observed without a token and the normal atomic recovery starts from the frozen local cursor.
 - A short failure can recover within one health interval without revoking the user's existing arm, but only after authorization is rechecked and all catch-up pages plus buffered live messages are merged atomically.
 - A sustained or repeated failure publishes `reconnecting`, revokes live authorization, and requires a new manual confirmation after recovery.
-- A raw live message already reserved in a recovery buffer can appear immediately as a display-only `received` record. The callback carries no authorization token, and AI waits until the atomic catch-up order is known.
+- A timed-out target-channel, catch-up, authorization, disconnect, or connect operation cannot hold the single-flight health/recovery loop indefinitely. Readiness closes synchronously before asynchronous diagnostics. The next recovery tears down the sender even if its public `connected` flag is already false, so a late dial or pending request cannot accumulate behind a ghost connection.
+- A raw live message or bounded cursor-probe candidate already reserved in a recovery buffer can appear immediately as a display-only `received` record. The callback carries no authorization token, and AI waits until the atomic catch-up order is known.
 - Stopping monitoring, emergency stop, a fatal/rolled-back startup, or application shutdown terminally marks any still-pending display-only observation as `skipped`; a late canonical callback cannot restart it.
+- Stop uses a bounded drain, detaches any obsolete health single-flight, and identity-checks late recovery failures. A late operation from the stopped client cannot publish `reconnecting` or mutate a later monitor generation.
 - Catch-up messages remain `recovered` even if they are recent or processed after a later re-arm. They may be analyzed for visibility but can never trade.
 - Cursor, recovery revision, single-flight recovery, bounded live buffer, and FIFO reservation prevent partial batches or interleaving.
 
@@ -108,7 +115,7 @@ The application, not teleproto, owns reconnect sequencing. Library auto-reconnec
 - Private WebSocket order data is preferred for state transitions. Read-only REST reconciliation is used when needed.
 - If it is unclear whether a mutation crossed the exchange boundary, the operation becomes unknown, live trading is locked, and no automatic retry is allowed.
 - ACK, private order updates, and reconciliation update the journal through one controller FIFO. Account fingerprint, `instId`, `clOrdId`, and any known `ordId` are immutable identity. A pre-ACK terminal update is committed with its identity before later matching ACK/unknown evidence removes it; conflicting evidence remains locked. Finalized identity tombstones reject conflicting late ACK/order updates, so concurrency cannot recreate or silently rebind a finalized mutation.
-- A single not-found response is not absence evidence. The bounded absence rule is restricted to the same originating client and sufficient repeated evidence.
+- A single not-found response is not absence evidence. The bounded absence path is restricted to the same originating client and its process-bound error identity; controller retry snapshots do not transfer authority to a replacement client. Its scoped order/position results must all match the target instrument, and position effect uses the validated decimal value without floating-point underflow to zero.
 - After restart, account mismatch, malformed evidence, query failure, pending/partial state, a visible position effect without a matching order, and any number of not-found results all retain the durable interlock.
 - Normal pending orders and all eight supported pending strategy-order types are checked before connection, open, close, and credential changes. These exposure queries fail closed on request failure, malformed data, or an unproven complete result.
 

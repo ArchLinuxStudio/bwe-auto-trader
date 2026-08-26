@@ -486,6 +486,8 @@ export interface ChatGptServiceOptions {
   timeoutMs?: number
   maxTurnsPerThread?: number
   quotaRefreshIntervalMs?: number
+  rateLimitsPollIntervalMs?: number
+  rateLimitsReadTimeoutMs?: number
   now?: () => number
 }
 
@@ -552,6 +554,8 @@ export class ChatGptService {
   private readonly timeoutMs: number
   private readonly maxTurnsPerThread: number
   private readonly quotaRefreshIntervalMs: number
+  private readonly rateLimitsPollIntervalMs: number
+  private readonly rateLimitsReadTimeoutMs: number
   private readonly now: () => number
   private readonly statusListeners = new Set<(status: ChatGptServiceStatus) => void>()
   private readonly loginWaiters = new Map<string, Array<(result: LoginCompletion) => void>>()
@@ -561,11 +565,15 @@ export class ChatGptService {
   private unsubscribeNotifications: (() => void) | null = null
   private startPromise: Promise<void> | null = null
   private rateLimitsRefreshPromise: Promise<void> | null = null
+  private rateLimitsPollTimer: ReturnType<typeof setTimeout> | null = null
+  private rateLimitsPollGeneration = 0
+  private rateLimitsPollingPaused = false
   private rateLimitsEvidenceRevision = 0
   private quotaRefreshNotBefore = 0
   private queueTail: Promise<void> = Promise.resolve()
   private threadId: string | null = null
   private turnsOnThread = 0
+  private closed = false
   private status: ChatGptServiceStatus = {
     initialized: false,
     authenticated: false,
@@ -590,10 +598,13 @@ export class ChatGptService {
     this.timeoutMs = options.timeoutMs ?? 10_000
     this.maxTurnsPerThread = options.maxTurnsPerThread ?? 100
     this.quotaRefreshIntervalMs = Math.max(1, options.quotaRefreshIntervalMs ?? 60_000)
+    this.rateLimitsPollIntervalMs = Math.max(1, options.rateLimitsPollIntervalMs ?? 60_000)
+    this.rateLimitsReadTimeoutMs = Math.max(1, options.rateLimitsReadTimeoutMs ?? 10_000)
     this.now = options.now ?? Date.now
   }
 
   start(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('ChatGPT service is closed'))
     if (this.status.initialized) return Promise.resolve()
     if (this.startPromise) return this.startPromise
 
@@ -625,10 +636,14 @@ export class ChatGptService {
       requiresOpenaiAuth?: boolean
     }>('account/read', { refreshToken })
     const account = result.account ?? null
+    const authenticated = isChatGptAccount(account)
+    // Any authoritative account refresh is an identity boundary for an
+    // in-flight quota read, even when both accounts are authenticated.
+    this.rateLimitsEvidenceRevision += 1
     this.updateStatus({
       account,
-      authenticated: isChatGptAccount(account),
-      ...(!isChatGptAccount(account) ? { rateLimits: null, quotaExhausted: false } : {}),
+      authenticated,
+      ...(!authenticated ? { rateLimits: null, quotaExhausted: false } : {}),
       lastError: null,
     })
     return account
@@ -697,9 +712,20 @@ export class ChatGptService {
 
   async logout(): Promise<void> {
     await this.start()
-    await this.transport.request('account/logout')
+    this.rateLimitsPollingPaused = true
+    this.rateLimitsPollGeneration += 1
+    this.rateLimitsEvidenceRevision += 1
+    this.clearRateLimitsPollTimer()
+    try {
+      await this.transport.request('account/logout')
+    } catch (error) {
+      this.rateLimitsPollingPaused = false
+      this.syncRateLimitsPolling()
+      throw error
+    }
     this.threadId = null
     this.turnsOnThread = 0
+    this.rateLimitsPollingPaused = false
     this.updateStatus({
       authenticated: false,
       warmedUp: false,
@@ -743,18 +769,8 @@ export class ChatGptService {
       return null
     }
 
-    const requestedRevision = this.rateLimitsEvidenceRevision
-    try {
-      const result = await this.transport.request<ChatGptRateLimits>('account/rateLimits/read')
-      const outcome = this.commitRateLimitsRead(result, requestedRevision)
-      if (outcome === 'superseded' && this.status.quotaExhausted) {
-        this.refreshRateLimitsAuthoritatively()
-      }
-      return outcome === 'committed' ? result : this.getStatus().rateLimits
-    } catch (error) {
-      this.updateStatus({ lastError: errorMessage(error) })
-      return null
-    }
+    await this.refreshRateLimitsAuthoritatively()
+    return this.getStatus().rateLimits
   }
 
   async warmUp(): Promise<boolean> {
@@ -786,19 +802,27 @@ export class ChatGptService {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    this.rateLimitsPollGeneration += 1
+    this.rateLimitsEvidenceRevision += 1
+    this.clearRateLimitsPollTimer()
     this.unsubscribeNotifications?.()
     this.unsubscribeNotifications = null
     this.rejectAllTurnWaiters(new Error('ChatGPT service closed'))
+    this.updateStatus({
+      initialized: false,
+      authenticated: false,
+      busy: false,
+      warmedUp: false,
+      account: null,
+      rateLimits: null,
+      quotaExhausted: false,
+    })
     await this.transport.close()
     this.startPromise = null
     this.threadId = null
     this.turnsOnThread = 0
-    this.updateStatus({
-      initialized: false,
-      busy: false,
-      warmedUp: false,
-      quotaExhausted: false,
-    })
   }
 
   private async initialize(): Promise<void> {
@@ -810,7 +834,7 @@ export class ChatGptService {
       clientInfo: {
         name: 'bwe_auto_trader',
         title: 'BWE Auto Trader',
-        version: '0.1.7',
+        version: '0.1.8',
       },
       capabilities: {
         optOutNotificationMethods: [
@@ -840,10 +864,12 @@ export class ChatGptService {
       requiresOpenaiAuth?: boolean
     }>('account/read', { refreshToken: false })
     const account = result.account ?? null
+    const authenticated = isChatGptAccount(account)
+    this.rateLimitsEvidenceRevision += 1
     this.updateStatus({
       account,
-      authenticated: isChatGptAccount(account),
-      ...(!isChatGptAccount(account) ? { rateLimits: null, quotaExhausted: false } : {}),
+      authenticated,
+      ...(!authenticated ? { rateLimits: null, quotaExhausted: false } : {}),
     })
   }
 
@@ -860,16 +886,7 @@ export class ChatGptService {
   }
 
   private async loadRateLimitsWithoutStarting(): Promise<void> {
-    const requestedRevision = this.rateLimitsEvidenceRevision
-    try {
-      const result = await this.transport.request<ChatGptRateLimits>('account/rateLimits/read')
-      const outcome = this.commitRateLimitsRead(result, requestedRevision)
-      if (outcome === 'superseded' && this.status.quotaExhausted) {
-        this.refreshRateLimitsAuthoritatively()
-      }
-    } catch {
-      if (!this.status.quotaExhausted) this.updateStatus({ rateLimits: null })
-    }
+    await this.refreshRateLimitsAuthoritatively()
   }
 
   private async refreshAfterLogin(): Promise<void> {
@@ -1104,6 +1121,7 @@ export class ChatGptService {
       const authMode = typeof params?.authMode === 'string' ? params.authMode : null
       const planType = typeof params?.planType === 'string' ? params.planType : null
       const authenticated = authMode === 'chatgpt' || authMode === 'chatgptAuthTokens'
+      this.rateLimitsEvidenceRevision += 1
       this.updateStatus({
         authenticated,
         account: authenticated
@@ -1179,15 +1197,17 @@ export class ChatGptService {
     this.refreshRateLimitsAuthoritatively()
   }
 
-  private refreshRateLimitsAuthoritatively(): void {
-    if (!this.status.authenticated) return
-    if (this.rateLimitsRefreshPromise) return
+  private refreshRateLimitsAuthoritatively(): Promise<void> {
+    if (this.closed || this.rateLimitsPollingPaused || !this.status.authenticated) {
+      return Promise.resolve()
+    }
+    if (this.rateLimitsRefreshPromise) return this.rateLimitsRefreshPromise
     this.rateLimitsRefreshPromise = (async () => {
       try {
-        while (this.status.authenticated) {
+        while (!this.closed && !this.rateLimitsPollingPaused && this.status.authenticated) {
           const requestedRevision = this.rateLimitsEvidenceRevision
           try {
-            const result = await this.transport.request<ChatGptRateLimits>('account/rateLimits/read')
+            const result = await this.requestRateLimitsSnapshot()
             const outcome = this.commitRateLimitsRead(result, requestedRevision)
             if (outcome === 'superseded') continue
             return
@@ -1203,13 +1223,14 @@ export class ChatGptService {
         this.rateLimitsRefreshPromise = null
       }
     })()
+    return this.rateLimitsRefreshPromise
   }
 
   private commitRateLimitsRead(
     result: ChatGptRateLimits,
     requestedRevision: number,
   ): 'committed' | 'superseded' | 'unauthenticated' {
-    if (!this.status.authenticated) return 'unauthenticated'
+    if (this.closed || !this.status.authenticated) return 'unauthenticated'
     if (requestedRevision !== this.rateLimitsEvidenceRevision) return 'superseded'
     this.updateStatus({
       rateLimits: result,
@@ -1221,6 +1242,7 @@ export class ChatGptService {
   private updateStatus(patch: Partial<ChatGptServiceStatus>): void {
     this.status = { ...this.status, ...patch }
     if (!this.status.quotaExhausted) this.quotaRefreshNotBefore = 0
+    this.syncRateLimitsPolling()
     const snapshot = this.getStatus()
     for (const listener of this.statusListeners) {
       try {
@@ -1229,6 +1251,66 @@ export class ChatGptService {
         // Status observers are UI concerns and must not affect trading analysis.
       }
     }
+  }
+
+  private async requestRateLimitsSnapshot(): Promise<ChatGptRateLimits> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      controller.abort(new Error('ChatGPT rate-limit read timed out'))
+    }, this.rateLimitsReadTimeoutMs)
+    timer.unref?.()
+    try {
+      return await this.transport.request<ChatGptRateLimits>(
+        'account/rateLimits/read',
+        undefined,
+        { signal: controller.signal },
+      )
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private syncRateLimitsPolling(): void {
+    if (
+      this.closed ||
+      this.rateLimitsPollingPaused ||
+      !this.status.initialized ||
+      !this.status.authenticated
+    ) {
+      this.clearRateLimitsPollTimer()
+      return
+    }
+    if (this.rateLimitsPollTimer) return
+
+    const generation = this.rateLimitsPollGeneration
+    const timer = setTimeout(() => {
+      if (this.rateLimitsPollTimer !== timer) return
+      this.rateLimitsPollTimer = null
+      if (
+        generation !== this.rateLimitsPollGeneration ||
+        this.closed ||
+        !this.status.initialized ||
+        !this.status.authenticated
+      ) {
+        return
+      }
+      void this.refreshRateLimitsAuthoritatively().then(
+        () => this.rescheduleRateLimitsPolling(generation),
+        () => this.rescheduleRateLimitsPolling(generation),
+      )
+    }, this.rateLimitsPollIntervalMs)
+    timer.unref?.()
+    this.rateLimitsPollTimer = timer
+  }
+
+  private rescheduleRateLimitsPolling(generation: number): void {
+    if (generation !== this.rateLimitsPollGeneration) return
+    this.syncRateLimitsPolling()
+  }
+
+  private clearRateLimitsPollTimer(): void {
+    if (this.rateLimitsPollTimer) clearTimeout(this.rateLimitsPollTimer)
+    this.rateLimitsPollTimer = null
   }
 }
 

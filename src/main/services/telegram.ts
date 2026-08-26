@@ -120,6 +120,7 @@ export interface TelegramMonitorOptions {
   reconnectRetries?: number
   reconnectDelayMs?: number
   healthCheckIntervalMs?: number
+  healthProbeTimeoutMs?: number
   catchUpLimit?: number
   deduplicationCapacity?: number
   stopDrainTimeoutMs?: number
@@ -159,6 +160,8 @@ const DEFAULT_PROXY_PORT = 7890
 const DISCONNECT_CONFIRMATION_CHECKS = 2
 const MAX_RECOVERY_BUFFER_MESSAGES = 5_000
 const DEFAULT_STOP_DRAIN_TIMEOUT_MS = 2_000
+const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 5_000
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 4_000
 
 export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private client?: TelegramClient
@@ -174,6 +177,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private stopRequested = false
   private reconnecting = false
   private recoveryPending = false
+  private forceReconnectOnRecovery = false
   private recoveryPromise?: Promise<void>
   private recoveryRevision = 0
   private recoveryMessageBuffer: QueuedTelegramMessage[] = []
@@ -296,6 +300,10 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     )
 
     this.client = undefined
+    // The bounded drain may intentionally return while an injected or broken
+    // transport Promise is still pending. Detach the old single-flight handle
+    // so a later start cannot inherit and wait on that obsolete health task.
+    this.healthCheckPromise = undefined
     this.channelEntity = undefined
     this.eventBuilder = undefined
     this.eventHandler = undefined
@@ -304,6 +312,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.activeProxyProtocol = undefined
     this.reconnecting = false
     this.recoveryPending = false
+    this.forceReconnectOnRecovery = false
     this.recoveryPromise = undefined
     this.recoveryRevision = 0
     this.recoveryMessageBuffer = []
@@ -347,6 +356,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.lastSeenMessageId = 0
     this.reconnecting = false
     this.recoveryPending = false
+    this.forceReconnectOnRecovery = false
     this.recoveryPromise = undefined
     this.recoveryRevision = 0
     this.recoveryMessageBuffer = []
@@ -727,11 +737,15 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       if (this.client !== client || this.channelEntity !== channel || !client.connected) {
         throw new Error('Telegram connection changed during catch-up')
       }
-      const messages = await client.getMessages(channel, {
-        limit: batchSize,
-        minId: cursor,
-        reverse: true,
-      })
+      const messages = await resolveWithin(
+        client.getMessages(channel, {
+          limit: batchSize,
+          minId: cursor,
+          reverse: true,
+        }),
+        this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+        'Telegram catch-up page timed out',
+      )
       if (this.client !== client || this.channelEntity !== channel || !client.connected) {
         throw new Error('Telegram disconnected during catch-up')
       }
@@ -763,7 +777,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
 
   private startHealthTimer(): void {
     this.clearHealthTimer()
-    const interval = this.options.healthCheckIntervalMs ?? 5_000
+    const interval = this.options.healthCheckIntervalMs ?? DEFAULT_HEALTH_CHECK_INTERVAL_MS
     this.healthTimer = setInterval(() => {
       void this.healthCheck()
     }, interval)
@@ -779,7 +793,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
 
   private scheduleRecoveryConfirmation(): void {
     if (this.recoveryConfirmationTimer || this.stopRequested) return
-    const interval = this.options.healthCheckIntervalMs ?? 5_000
+    const interval = this.options.healthCheckIntervalMs ?? DEFAULT_HEALTH_CHECK_INTERVAL_MS
     this.recoveryConfirmationTimer = setTimeout(() => {
       this.recoveryConfirmationTimer = undefined
       if (this.stopRequested || !this.recoveryPending) return
@@ -809,6 +823,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
 
   private async healthCheckInternal(): Promise<void> {
     const client = this.client
+    const channel = this.channelEntity
     if (this.stopRequested || !client) return
     if (this.recoveryPromise) return
 
@@ -827,26 +842,84 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     }
 
     const probeRevision = this.recoveryRevision
-    let authorized = false
+    let latestMessageId = 0
+    let latestProbeMessage: Api.Message | undefined
     try {
-      authorized = await client.checkAuthorization()
+      // A generic authorization RPC can stay healthy while a target channel's
+      // pushed updates are delayed or lost. Probe that channel's newest cursor
+      // directly so a missed NewMessage is discovered within one health cycle.
+      if (!channel) throw new Error('Telegram channel is unavailable during health probe')
+      const messages = await resolveWithin(
+        client.getMessages(channel, { limit: 1 }),
+        this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+        'Telegram target-channel health probe timed out',
+      )
+      const latest = messages[0]
+      if (latest && (!Number.isSafeInteger(latest.id) || latest.id <= 0)) {
+        throw new Error('Telegram target-channel health probe returned an invalid message id')
+      }
+      latestProbeMessage = latest
+      latestMessageId = latest?.id ?? 0
     } catch (error) {
-      await this.reportError(error, true)
+      const shouldForceReconnect = isLikelyProxyOrNetworkError(error)
+      if (
+        this.stopRequested ||
+        this.client !== client ||
+        this.channelEntity !== channel ||
+        this.recoveryRevision !== probeRevision ||
+        this.recoveryPending
+      ) {
+        return
+      }
+      if (shouldForceReconnect) this.forceReconnectOnRecovery = true
+      // Fail closed before invoking any external error callback. A stuck audit
+      // or notification listener must not leave readiness open or monopolize
+      // the single-flight health loop after the RPC deadline has elapsed.
+      this.recordFailedConnectionSample()
+      const reconnectConfirmed = this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS
+      if (reconnectConfirmed) {
+        this.publishConfirmedReconnect('Telegram target-channel health probe failed twice')
+      }
+      void this.reportError(error, true)
+      if (reconnectConfirmed) {
+        await this.beginRecovery().catch(() => undefined)
+      }
+      return
     }
     if (
       this.stopRequested ||
       this.client !== client ||
+      this.channelEntity !== channel ||
       this.recoveryRevision !== probeRevision ||
       this.recoveryPending
     ) {
       return
     }
-    if (!authorized) {
+    if (!client.connected) {
       this.recordFailedConnectionSample()
       if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
-        this.publishConfirmedReconnect('Telegram authorization probe failed twice')
+        this.publishConfirmedReconnect('Telegram disconnected during target-channel health probe')
         await this.beginRecovery().catch(() => undefined)
       }
+      return
+    }
+
+    if (latestMessageId > this.lastSeenMessageId) {
+      // The remote cursor proves that at least one target-channel post did not
+      // enter the raw live handler. Freeze the known-good cursor synchronously
+      // and reuse the existing atomic catch-up/live-buffer hand-off. These
+      // messages remain recovered and can never inherit trading authority.
+      this.markRecoveryPending()
+      if (latestProbeMessage) {
+        const receivedAt = new Date()
+        if (this.bufferRecoveryMessage(latestProbeMessage, receivedAt)) {
+          // The bounded probe returned a trusted target-channel message. Show
+          // it immediately as a no-token recovery preview while canonical AI
+          // delivery still waits for the complete ordered catch-up.
+          this.observeBufferedRawMessage(latestProbeMessage, receivedAt)
+        }
+      }
+      await this.beginRecovery().catch(() => undefined)
       return
     }
 
@@ -908,8 +981,13 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private beginRecovery(): Promise<void> {
     if (this.recoveryPromise) return this.recoveryPromise
 
-    const operation = this.recoverConnection().catch(async (error) => {
-      if (!this.stopRequested) {
+    const recoveryClient = this.client
+    const operation = this.recoverConnection().catch((error) => {
+      // stop() has a bounded drain and a later start may already own a new
+      // client when this old operation finally rejects. Never let that stale
+      // failure mutate the new monitor generation.
+      if (!this.stopRequested && this.client === recoveryClient) {
+        if (isLikelyProxyOrNetworkError(error)) this.forceReconnectOnRecovery = true
         this.disconnectedChecks = Math.min(
           DISCONNECT_CONFIRMATION_CHECKS,
           Math.max(1, this.disconnectedChecks) + 1,
@@ -917,7 +995,9 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
         if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
           this.publishConfirmedReconnect('Telegram recovery could not be verified')
         }
-        await this.reportError(error, true)
+        // Recovery state is already closed/published. Keep diagnostics outside
+        // the recovery Promise so a broken listener cannot block the retry.
+        void this.reportError(error, true)
       }
       throw error
     })
@@ -943,19 +1023,40 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
       this.recoveryBufferOverflow = false
     }
     const recoveryCursor = this.recoveryFromMessageId ?? this.lastSeenMessageId
-    if (!client.connected) await client.connect()
-    if (this.stopRequested) throw new Error('Telegram recovery cancelled')
-    if (!client.connected || !(await client.checkAuthorization())) {
-      throw new Error('Telegram session is not connected and authorized')
+    if (this.forceReconnectOnRecovery) {
+      // A timed-out target-channel RPC can leave teleproto reporting
+      // `connected` while its request pipeline is no longer making progress.
+      // Always tear down that sender—even when `connected` is already false—
+      // so an in-flight connect attempt is cancelled before retrying.
+      this.forceReconnectOnRecovery = false
+      await resolveWithin(
+        client.disconnect(),
+        this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+        'Telegram forced disconnect timed out',
+      )
     }
+    if (!client.connected) {
+      await resolveWithin(
+        client.connect(),
+        this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+        'Telegram reconnect attempt timed out',
+      )
+    }
+    if (this.stopRequested) throw new Error('Telegram recovery cancelled')
+    if (!client.connected) throw new Error('Telegram session is not connected')
 
     // connect() may rotate through several DC addresses and emit a transient
-    // disconnected update before a later internal attempt succeeds. Snapshot
-    // only after that whole connection/authentication phase; from this point
-    // onward, a new negative update invalidates the catch-up window.
+    // disconnected update before a later internal attempt succeeds. The
+    // authenticated catch-up RPC below is also the pre-merge authorization
+    // proof. Snapshot only after connect(); from this point onward, a new
+    // negative update invalidates the catch-up window.
     const recoveryRevision = this.recoveryRevision
     const caughtUpMessages = await this.collectCatchUpMessages(recoveryCursor)
-    const authorizationStillValid = client.connected && (await client.checkAuthorization())
+    const authorizationStillValid = client.connected && (await resolveWithin(
+      client.checkAuthorization(),
+      this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+      'Telegram recovery authorization probe timed out',
+    ))
     if (
       this.stopRequested ||
       this.client !== client ||
@@ -976,6 +1077,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.recoveryMessageBuffer = []
     this.recoveryBufferOverflow = false
     this.recoveryPending = false
+    this.forceReconnectOnRecovery = false
     this.clearRecoveryConfirmationTimer()
     this.recoveryFromMessageId = undefined
     this.disconnectedChecks = 0
@@ -1461,6 +1563,25 @@ async function settleWithin(operation: Promise<unknown>, timeoutMs: number): Pro
   }
 }
 
+async function resolveWithin<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 function validateOptions(options: TelegramMonitorOptions): void {
   if (!Number.isSafeInteger(options.apiId) || options.apiId <= 0) {
     throw new TypeError('Telegram apiId must be a positive integer')
@@ -1492,6 +1613,12 @@ function validateOptions(options: TelegramMonitorOptions): void {
     (!Number.isSafeInteger(options.healthCheckIntervalMs) || options.healthCheckIntervalMs < 1_000)
   ) {
     throw new TypeError('Telegram healthCheckIntervalMs must be at least 1000')
+  }
+  if (
+    options.healthProbeTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.healthProbeTimeoutMs) || options.healthProbeTimeoutMs <= 0)
+  ) {
+    throw new TypeError('Telegram healthProbeTimeoutMs must be a positive integer')
   }
   if (
     options.stopDrainTimeoutMs !== undefined &&

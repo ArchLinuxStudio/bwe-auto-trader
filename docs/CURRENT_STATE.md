@@ -1,61 +1,67 @@
 # Current State
 
-Checkpoint date: 2026-08-24, Asia/Shanghai.
+Checkpoint date: 2026-08-26, Asia/Shanghai.
 
 ## Current Objective
 
-The Windows x64 `v0.1.7` release is complete. It publishes the durable mutation journal together with the Telegram immediate-visibility, network-diagnostics, and ChatGPT quota fixes. The tagged source, `main`, checksums, installer, portable archive, licenses, and GitHub Release are the current public checkpoint.
+The Windows x64 `v0.1.8` release is complete. It packages the accumulated OKX fail-closed hardening, Telegram cursor-latency recovery, Windows tray lifecycle, and dynamic ChatGPT/Codex quota work; the annotated source tag and five explicit GitHub Release assets are the public checkpoint.
 
-Implementation, packaging, artifact QA, commit, tag, push, and GitHub Release publication are complete. The first real dedicated-sub-account test remains pending and still requires explicit authorization in the current Thread before any private connection or order.
+Code review found no P0/P1 release blocker. Version/runtime identity, standard gates, Windows packaging, afterPack, archive inspection, isolated cold start, native window/tray wiring checks, checksums, commit, annotated tag, atomic push, draft-asset verification, and final publication all use the same `0.1.8` source state.
+
+Real Telegram/ChatGPT latency, real-account quota behavior, interactive Explorer tray-menu cleanup, and the first dedicated-sub-account end-to-end test remain pending. They require the corresponding user environment or explicit private-service authorization; none was inferred from the packaging/release request.
 
 ## Current Status
 
-- Version: `0.1.7` in `package.json` and `package-lock.json`.
+- Version: `0.1.8` in `package.json`, `package-lock.json`, the production manifest/notices, renderer fallback, and Codex app-server client metadata.
 - Branch: `main`.
-- HEAD, `origin/main`, and tag `v0.1.7`: the release commit containing this checkpoint.
-- Published release: [`v0.1.7`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.7).
-- Previous published baseline: [`v0.1.6`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.6) at `2a06b70252ed98209d13bf8bc5e9038714c38f4d`.
-- The durable-journal, Telegram early-visibility, network-diagnostics, and ChatGPT quota implementations are present in the tagged source and `v0.1.7` binaries.
-- The Windows x64 `v0.1.7` NSIS/ZIP artifacts completed build, afterPack, archive inspection, hashing, and portable isolated cold-start QA. macOS/Linux still have source/package configuration only and are not release-verified.
+- Current published source/release: annotated tag [`v0.1.8`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.8); Git is the authority for its release commit and tag-object identities.
+- Previous published baseline: [`v0.1.7`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.7) at release commit `50153e19c91c019dfe103f4f27253e5c169fa204`; its annotated tag object is `7e6da16119159dda926ee7360e33a1ad26a417c1` and must not be moved or rewritten.
+- The durable journal, immediate Telegram visibility, network diagnostics, explicit quota exhaustion, and all `v0.1.8` hardening/features are present in the tagged source and Windows binaries.
+- A 2026-08-25 user test of the tagged Windows build observed approximately two minutes between target-channel publication and timeline receipt. The exact private network/proxy trigger is not locally reproduced, but the tagged health loop's inability to compare the target-channel cursor is confirmed in source.
+- The Windows x64 `v0.1.8` NSIS/ZIP artifacts completed build, afterPack, archive inspection, hashing, isolated cold start, and automated packaged close/hide/second-instance/minimized-restore QA. macOS/Linux still have source/package configuration only and are not release-verified.
 - No real Telegram, ChatGPT, or OKX private call and no real order was executed by Codex.
+- `v0.1.8` strictly validates exact order details, documented normal-order states, ordinary pending-order entries/completeness, and position entries before any opening-preflight or reconciliation safety decision. Exact same-origin reconciliation also rejects a valid-looking scoped response for another instrument, and decimal position-effect checks do not collapse a mathematically non-zero value through JavaScript number underflow. Repeated mutation lifecycle events can no longer change the committed exchange `expTime` or regress a later lifecycle to `transmitting`.
+- The accepted cross-client design requires revision-bound, complete order/pending/history/fill evidence and a durable absence certificate/tombstone. Its automatic release gate is intentionally disabled until an authoritative OKX visibility bound exists.
+- The `v0.1.8` Telegram monitor probes the target channel every five seconds with a four-second RPC deadline. A newer remote cursor is immediately shown as a no-token recovered preview, then goes through the existing atomic catch-up before AI; it can never trade. A timed-out channel/catch-up RPC fails closed and makes the next recovery rebuild the sender.
+- The `v0.1.8` Electron main process owns a strong native tray reference. With a usable tray, title-bar close hides the existing window; tray activation/menu, platform activation, and a second instance use one guarded restore-or-create path. Explicit quit uses a three-phase shutdown gate so repeated quit requests cannot bypass IPC removal and `AppController.dispose()`. If tray creation fails, Windows/Linux retain normal close-to-exit behavior.
+- The `v0.1.8` ChatGPT service applies official rolling quota notifications immediately and performs a complete rate-limit read every 60 seconds for the authenticated service lifetime. All complete-read triggers share a single-flight request with a 10-second deadline; failures preserve the last trusted value, and logout/close stop future scheduling and isolate late results.
+- The `v0.1.8` settings UI displays current-cycle remaining percentage rather than used percentage, with a matching remaining-capacity bar and explicit one-minute cadence.
 
 ## Completed
 
-Release baseline already present at HEAD:
+Baseline inherited from `v0.1.6`:
 
-- teleproto transport with application-owned atomic catch-up and recovered-message trading isolation.
-- Message-time authorization through the final OKX POST guard.
-- REST ACK/private-stream order state machine, same-origin unknown no-retry reconciliation, credential lifecycle safety, and independent `reduceOnly` manual close.
-- Direct-first OKX routing with fixed fallback and no post-mutation route retry.
-- Windows x64 `v0.1.6` NSIS/portable release and reviewed dependency/runtime-license gates.
+- Pinned teleproto transport with application-owned atomic catch-up, ingress-time authorization, recovered-message trading isolation, the final OKX POST guard, fixed private routing, no-retry unknown handling, and independent `reduceOnly` manual close.
 
-Post-release changes in this working tree:
+Changes delivered in `v0.1.7` relative to `v0.1.6`:
 
-- Added `mutation-journal.v1.json`, owned by the Electron main process, with a 128 KiB/16-record bound, strict lifecycle-dependent schema, serialized copy-on-write, file sync, atomic rename, and fail-closed corruption/oversize behavior.
-- Added awaited `prepared` and `transmitting` commits after unique `clOrdId` generation. `transmitting` records the exact exchange `expTime`; the synchronous authorization guard runs again after that commit and immediately before fetch.
-- Added monotonic lifecycle/reconciliation updates for ACK, private order evidence, unknown results, pending/partial state, terminal state, and same-origin resolution. A still-running request may clear `transmitting` only when its final guard proves fetch never began; startup cannot infer that evidence.
-- Made account fingerprint, `instId`, `clOrdId`, and any known `ordId` immutable evidence. Conflicting or incomplete exchange identity fails closed instead of rebinding or deleting a record.
-- Serialized controller journal transitions so terminal evidence and a concurrent late ACK cannot race. A pre-ACK terminal update with `clOrdId` is first persisted with its `ordId`; an update containing only `ordId` is buffered until ACK provides the binding. Conflicting late ACK/order evidence fails closed.
-- Added startup journal loading without auto-connect or auto-arm. Only a semantically valid `prepared` record is locally removable; every phase at or after `transmitting` remains locked.
-- Added explicit-connect GET-only recovery bound to a SHA-256 fingerprint of the OKX account `uid`. Exact terminal evidence may clear; pending/partial, account or order identity mismatch, malformed/query failure, position-only evidence, and any number of replacement-client not-found results remain locked.
-- Added early blockers for arm, credential replacement, open, and close while the journal is unresolved or unhealthy.
-- Added targeted mock tests for the durable boundary, restart phases, corruption/semantic contradictions, immutable identity, first-read/write serialization, concurrent terminal/late-ACK ordering, pre-ACK terminal replay, and cross-client fail-closed behavior.
-- Added a no-token, display-only callback for raw Telegram messages successfully reserved in startup/recovery buffers. The timeline now receives one immediate `received + recovered` record while canonical catch-up/FIFO ordering remains unchanged.
-- Reused that record at canonical handoff before starting AI, kept `recovered` sticky, and retained the permanent no-order rule. Healthy live messages continue to publish `received -> analyzing` immediately without waiting for AI completion.
-- Terminally skip and atomically consume pending observations when stop/emergency/startup rollback/shutdown abandons their flow. Cleanup continues across per-record listener errors, preventing an indefinite “waiting for verification” card, a late callback revival, or an asynchronous multi-record cleanup race.
-- Added monitor/coordinator/controller-wiring tests for early startup/recovery visibility, immediate snapshots, canonical de-duplication, AI ordering, no-order isolation, bounded shutdown, and abandoned-observation cleanup. Updated the renderer copy to distinguish AI analysis from Telegram continuity verification.
-- Added a renderer-owned diagnostics presentation model keyed by `checkedAt`, so never-run, completed-success, and completed-negative probes are distinct. A missing direct IP after a run now says it was checked but not obtained; Clash/protocol/OKX failures show “检测未通过” or “未识别” instead of “未验证”.
-- Added checked time and the direct/proxy address outcome to the settings summary. The button now reports a warning with the specific incomplete probe names when the diagnostic flow completed with negative results, rather than unconditionally presenting success.
-- Added pure tri-state presentation tests, including `checkedAt=0`, and tightened the service test contract that an optional OKX failure still returns a completed timestamp.
-- Added a dedicated ChatGPT quota state that recognizes structured `usageLimitExceeded`, all nested percentage windows including `secondary`, `spendControlReached`, and existing text fallbacks. Sparse rate-limit notifications preserve unavailable `null` fields, update the matching `rateLimitsByLimitId` bucket, and trigger a revisioned authoritative refresh while exhausted. All full-read entry points now share the same evidence revision, so pending, failed, or superseded responses cannot clear newer exhaustion evidence. Quota skips also start a non-blocking, single-flight, 60-second-throttled full read, allowing later messages to detect natural recovery even if a rolling recovery notification was missed.
-- Quota exhaustion now revokes the main-process live capability, blocks re-arming and the final message authorization path, emits one explicit warning, and keeps the authenticated ChatGPT transport represented separately from Telegram monitoring. Monitoring remains running and can be restarted while quota is unavailable; recovery never restores live authorization automatically.
-- Each channel message received during quota exhaustion remains in the signal timeline, ends as a clearly worded non-trading `SKIP`, and never reaches the OKX order boundary. The ChatGPT settings card shows a persistent exhausted state and explains that Telegram reception continues.
-- Added service, coordinator, and controller regressions for secondary quota, spend control, sparse updates, structured failures, de-duplicated warning, multi-message visibility, monitoring restart, maximum quota percentage, no-order behavior, recovery without automatic re-arm, pending/failed refreshes, stale initialization/public reads, an older turn completing after newer exhaustion evidence, and throttled recovery without a rolling notification.
-- Updated README, architecture, decisions, TODO, known issues, and this checkpoint to match the code.
+- Added the strict, bounded, fsync-backed, non-replayable `mutation-journal.v1.json` and fail-closed restart recovery. Durable `prepared`/`transmitting` boundaries, immutable exchange identity, serialized evidence updates, and journal health now block unsafe arm, credential replacement, open, and close operations.
+- Made Telegram messages visible immediately after local receipt or successful startup/recovery buffer reservation. Recovery observations remain no-token, sticky `recovered`, canonical-FIFO ordered, terminally cleaned up when abandoned, and permanently unable to trade.
+- Added `checkedAt`-based tri-state network-diagnostics presentation so completed negative/incomplete probes no longer appear as “尚未检测/未验证”.
+- Added explicit ChatGPT quota exhaustion state, structured and fallback evidence parsing, stale-read protection, throttled recovery checks, persistent user guidance, live-capability revocation, and per-message non-trading `SKIP` results while Telegram monitoring continues.
+- Added targeted mock/injected regressions for all four areas, updated the authoritative docs and user-facing README, built and inspected Windows x64 artifacts, cold-started the isolated portable package, committed/tagged/pushed the source, and published the five-asset GitHub Release.
+
+Changes delivered in `v0.1.8` relative to `v0.1.7`:
+
+- Made `exchangeExpiresAt` immutable after the durable `transmitting` commit and rejected a repeated transmitting event after lifecycle advancement.
+- Added strict runtime validation for exact order-details results, documented normal-order states, ordinary pending SWAP order entries, full 100-item pending pages, and positions used by opening preflight or same-origin unknown reconciliation. Same-origin scoped responses must contain only the requested instrument; the existing risk-reducing close path still intentionally filters unrelated valid instruments as required by the accepted decision. Malformed, incomplete, or conflicting evidence now blocks submission or keeps the unknown interlock instead of becoming absence/position proof.
+- Replaced floating-point position zero detection with a validated decimal-significand check, so values such as `1e-999` remain non-zero safety evidence. Reduce-only close now derives direction from the lexical sign and sends a trimmed unsigned size, avoiding both underflow misdirection and whitespace-corrupted quantities.
+- Added focused regressions for conflicting expiry evidence, malformed exact/pending/position responses, external orders with empty `clOrdId`, undocumented `rejected`/`failed` normal-order states, scoped identity conflicts, decimal underflow, normalized close direction/size, ordinary pending-page completeness, and malformed opening-position snapshots.
+- Accepted the evidence-gated cross-client certificate model in `docs/DECISIONS.md`; negative replacement-client evidence remains diagnostic and locked.
+- Replaced the generic authorization-only Telegram health probe with a bounded target-channel cursor probe. A proven cursor gap now freezes recovery state in the same synchronous turn, immediately exposes the probe result as a sticky recovered/no-token preview, and starts complete catch-up without waiting for teleproto's much later generic stale recovery.
+- Bounded channel probes, catch-up pages, final recovery authorization, forced disconnect, and reconnect at four seconds. A timeout closes readiness before asynchronous diagnostics; the next recovery cancels the old sender/dial before retrying. Bounded stop detaches obsolete health work, and late old-client recovery failure cannot mutate a restarted monitor.
+- Added injected regressions proving that a missed push is visible at the first default five-second tick, starts the real coordinator AI callback inside the ten-second acceptance window, carries no authorization even while the rest of the system is armed, and remains permanently non-trading. Tests also cover multi-message gap/residual-live FIFO, duplicate suppression, stale newer-cursor isolation, default/probe/catch-up/authorization/disconnect/connect deadlines, ghost rebuilding, and stop/restart generation isolation.
+- Added native main-process tray ownership with a compact bundled glyph, stable show/quit menu actions, title-bar close-to-hide, minimized/hidden restoration, second-instance/platform activation reuse, destroyed-window recreation, and a tray-unavailable close fallback. The tray is published only after the initially hidden renderer has loaded, and concurrent restore requests share one window-creation promise.
+- Replaced the old boolean shutdown gate with `idle -> disposing -> ready-to-quit` coordination. Repeated quit requests remain prevented until the one cleanup operation completes, then the final Electron quit is allowed; an early quit first settles the startup task so its failure handler cannot force-exit during controller disposal.
+- Added nine pure mock lifecycle regressions for close/hide, tray fallback, restore/focus, stable menu actions, repeated asynchronous quit, startup-before-dispose ordering, and cleanup failure. The full local suite and production build pass without starting Electron or accessing private services.
+- Replaced the login-only ChatGPT rate-limit snapshot with authenticated 60-second recursive polling while retaining immediate rolling-notification updates. Periodic, explicit, quota-skip, and notification-recovery reads share one bounded single-flight operation; stale account/evidence revisions and post-close completions cannot write state.
+- Paused quota polling before the logout RPC, preserved the last trusted value across timeout/failure, retried on a later cycle, and kept the existing invariant that quota recovery never restores live authorization automatically.
+- Added seven focused regressions for the one-minute cadence, the default 10-second read deadline, cross-trigger single-flight, logout pause, close isolation, no-message exhaustion recovery, and post-login polling. The focused quota suite, standard full suite, and production build pass without private-service access.
+- Synchronized the app, lockfile, runtime manifest/notices, renderer fallback, and Codex client metadata to `0.1.8`; built and inspected the Windows x64 package, generated explicit public checksums/notes, committed/tagged/pushed the source, and published only the five reviewed Release assets.
 
 ## In Progress
 
-No implementation, packaging, or publication step is partially underway. The Windows x64 `v0.1.7` release and QA records are complete.
+The `v0.1.8` source and Windows assets are published. The next user-visible work is installation testing for the remaining Explorer tray-menu/cleanup behavior, followed—only with explicit authorization—by real Telegram/ChatGPT timing and quota observation. Collection-only cross-client recovery remains queued with automatic negative-evidence release disabled. No private-service connection or real order was performed during release work.
 
 ## Relevant Files
 
@@ -67,37 +73,45 @@ No implementation, packaging, or publication step is partially underway. The Win
 | `docs/DECISIONS.md` | Accepted constraints and rejected approaches |
 | `docs/TODO.md` | Only unfinished executable work |
 | `docs/KNOWN_ISSUES.md` | Current limitations and active workarounds |
+| `src/main/index.ts` | Electron startup, native tray ownership, unified window restore, and orderly shutdown wiring |
+| `src/main/window-tray.ts` | Pure close/reveal/menu helpers and the repeated-quit-safe asynchronous shutdown coordinator |
 | `src/main/services/mutation-journal.ts` | Strict durable mutation schema, atomic store, identity binding, and resolution operations |
 | `src/main/services/okx.ts` | Final request boundary and awaited mutation lifecycle events |
 | `src/main/app-controller.ts` | Journal authority, evidence serialization, service lifecycle, Telegram observation wiring, account binding, and mutation blockers |
-| `src/main/services/telegram.ts` | Atomic Telegram recovery plus no-token early observation of successfully buffered raw messages |
-| `src/main/services/chatgpt.ts` | Codex protocol, classifier lifecycle, structured quota detection, and sparse rate-limit state |
+| `src/main/services/telegram.ts` | Live Telegram delivery, bounded target-channel cursor probes, atomic recovery, no-token early observation, and ghost-connection rebuilding |
+| `src/main/services/chatgpt.ts` | Codex protocol, classifier lifecycle, structured quota detection, immediate notifications, and bounded 60-second authenticated rate-limit polling |
 | `src/main/services/signal-coordinator.ts` | Immediate display records, canonical AI/order gates, quota-specific non-trading results, and runtime pending-order interlocks |
-| `src/shared/types.ts` | Public snapshot contract, including the dedicated ChatGPT quota flag |
-| `src/renderer/src/App.tsx` | Distinct pending UI for Telegram continuity verification versus AI analysis, plus persistent quota guidance |
+| `src/main/services/network-diagnostics.ts` | Informational direct/proxy/OKX probes and the authoritative completed-run `checkedAt` marker |
+| `src/shared/types.ts` | Public snapshot contract, including ChatGPT quota state and network-diagnostics completion data |
+| `src/renderer/src/App.tsx` | Distinct pending UI for Telegram continuity verification versus AI analysis, plus dynamic remaining-quota presentation |
 | `src/renderer/src/network-diagnostics-view.ts` | Tri-state mapping for never-run, successful, and completed-negative network probes |
 | `src/renderer/src/styles.css` | Diagnostic success/information/warning indicators |
-| `tests/telegram-monitor.test.ts` | Startup/recovery observation ordering, de-duplication, and bounded-stop tests |
+| `tests/telegram-monitor.test.ts` | Five-second missed-push detection/AI start, probe timeout/reconnect, startup/recovery ordering, de-duplication, and bounded-stop tests |
 | `tests/unit/app-controller-telegram-visibility.test.ts` | Main-process callback-to-snapshot wiring and emergency cleanup tests |
 | `tests/unit/network-diagnostics-view.test.ts` | Renderer diagnostics state and wording tests |
 | `tests/unit/network-diagnostics.test.ts` | Injected public/proxy probe behavior and completed-result contract |
-| `tests/unit/chatgpt.test.ts` | Structured/text quota classification, rate windows, sparse updates, and recovery |
+| `tests/unit/chatgpt.test.ts` | Structured/text quota classification, rate windows, sparse updates, polling lifecycle, timeout/single-flight behavior, and recovery |
 | `tests/unit/signal-coordinator.test.ts` | Immediate stages, canonical reuse, non-trading recovery, and abandonment tests |
-| `tests/unit/mutation-journal.test.ts` | Store lifecycle, integrity, identity, serialization, and redaction tests |
-| `tests/unit/okx.test.ts` | Durable precommit/final-guard/ACK/unknown/rejection boundary tests |
-| `tests/unit/app-controller-okx-route.test.ts` | Restart recovery, controller races, identity mismatch, and blocker tests |
+| `tests/unit/mutation-journal.test.ts` | Store lifecycle, integrity, identity, immutable expiry, serialization, and redaction tests |
+| `tests/unit/okx.test.ts` | Durable precommit/final-guard/ACK/unknown/rejection boundaries, strict response validation, and malformed preflight/reconciliation evidence tests |
+| `tests/unit/app-controller-okx-route.test.ts` | Restart recovery, controller races, identity mismatch, mutation blockers, and ChatGPT quota lifecycle/warning tests |
+| `tests/unit/window-tray.test.ts` | Close-to-hide, tray fallback, restore/menu behavior, and asynchronous shutdown-gate tests |
 
 ## Current Implementation
 
 The renderer invokes a frozen preload API. Trusted IPC handlers call `AppController`, which remains the only authority for credentials, live capabilities, service lifecycles, positions, close operations, and durable order evidence.
 
-On a healthy Telegram path, canonical delivery publishes `received` and `analyzing` before awaiting ChatGPT. If startup/recovery ordering holds a raw update, Telegram first emits a separate no-token observation only after buffer reservation; the coordinator publishes one `received + recovered` record immediately. Canonical FIFO handoff later reuses that record and begins AI, but sticky `recovered` metadata prevents any order. If that flow is abandoned first, the record becomes terminal `skipped` and cannot be revived by a late callback.
+After controller/IPC initialization, the main process loads the initially hidden renderer, attaches controller events, creates one native tray, marks startup complete, and only then reveals the window. A usable tray changes title-bar close into `preventDefault()` plus `hide()`; it does not dispose or mutate the controller. Tray activation, its show action, a second-instance event, and platform activation share one initialized/not-shutting-down restore-or-create path. Concurrent restore requests await the same window-creation promise, then restore a minimized window before showing and focusing it. Explicit tray quit calls the normal Electron quit path. The shutdown coordinator prevents both the first and repeated `before-quit` events; the first request synchronously disables restoration, destroys the tray, and removes IPC, then waits for any in-flight startup before disposing the controller and permitting the final quit. With no usable tray, close interception is disabled so Windows/Linux cannot leave an unreachable background process.
+
+On a healthy Telegram path, the raw `NewMessage` callback still delivers immediately and canonical processing publishes `received` and `analyzing` before awaiting ChatGPT. Independently, every five seconds a four-second-bounded `getMessages(limit=1)` request compares the target channel's newest message ID with the local delivered cursor. A newer remote cursor synchronously closes readiness, freezes the cursor, reserves the returned message as a no-token recovered preview, and starts the existing full-page atomic catch-up. Canonical FIFO handoff later reuses that record and begins AI, but sticky `recovered` metadata prevents any order. Target-channel/catch-up/authorization and forced disconnect/connect operations all have deadlines; readiness closes before non-blocking diagnostics, and the next recovery tears down the sender even if it only appears disconnected. Bounded stop detaches old health work and client-identity checks late failures so a restarted monitor is not polluted. If a preview flow is abandoned first, the record becomes terminal `skipped` and cannot be revived by a late callback.
 
 Network diagnostics remain optional and informational. The main process returns `checkedAt` even when an individual probe times out, returns an invalid response, or cannot obtain an IP. The renderer now uses that completion marker as the tri-state authority and does not treat a negative boolean or missing IP as “never checked”.
 
-ChatGPT quota exhaustion is carried as a dedicated service/controller state rather than a generic sticky connection error. A transition to exhausted synchronously invalidates live authorization and emits one warning, while the ChatGPT authenticated transport and Telegram monitoring remain connected. Later messages continue through the coordinator, are retained on the timeline with quota-specific wording, and return before any exchange operation. New classifier turns are blocked while exhaustion is known, and an older in-flight turn is reduced to the same quota `SKIP` if newer exhaustion evidence arrives. A quota skip may initiate a throttled background full read; only a latest-revision full read can clear analysis unavailability, and recovery never re-arms live trading.
+ChatGPT quota exhaustion is carried as a dedicated service/controller state rather than a generic sticky connection error. While initialized and authenticated, rolling app-server notifications update the value immediately and a recursive timer requests a complete snapshot every 60 seconds. The request is bounded to 10 seconds and shared across periodic, explicit, notification-recovery, and quota-skip triggers, so calls never overlap. A failed or timed-out latest read leaves the previous trusted value intact and the next cycle retries. Account/quota evidence revisions prevent stale completion, logout pauses polling before its RPC, and close clears scheduling and rejects late commits. The renderer derives and displays the current-cycle remaining percentage from this live main-process state. A transition to exhausted synchronously invalidates live authorization and emits one warning, while the ChatGPT authenticated transport and Telegram monitoring remain connected. Later messages continue through the coordinator, are retained on the timeline with quota-specific wording, and return before any exchange operation. New classifier turns are blocked while exhaustion is known, and an older in-flight turn is reduced to the same quota `SKIP` if newer exhaustion evidence arrives. Only a latest-revision full read can clear analysis unavailability, and recovery never re-arms live trading.
 
 For an order mutation, `OkxV5Client` completes read-only prerequisites and generates a unique `clOrdId`. It then awaits a `prepared` journal commit. Immediately before the order fetch it awaits `transmitting` with the exact exchange expiry, re-runs the existing synchronous live/message generation guard, and only then permits fetch. The journal contains no replay API or persisted authorization capability.
+
+The committed exchange expiry is immutable: an idempotent repeated `transmitting` event must carry the same value, and a later lifecycle cannot regress to transmission. Exact order details must now return at most one strictly matching SWAP order in a documented normal state; the controller applies the same state allowlist before durable private-stream evidence can resolve a record. Ordinary pending-order entries are validated, requests explicitly use the 100-item maximum, and a full page is rejected as incomplete. Every returned SWAP position is structurally validated, and same-origin reconciliation additionally requires all scoped position/pending results to match the requested instrument. Position zero/non-zero classification and reduce-only close direction use the exact decimal significand/sign rather than a potentially underflowed JavaScript `Number`; the submitted close size is trimmed and unsigned. These checks are local fail-closed hardening; they do not enable cross-client absence release.
 
 ACK, private-stream updates, read-only recovery, and same-origin evidence enter one controller FIFO. Composite order identity cannot change after it becomes known. Terminal evidence is durably committed; when ACK identity is still pending it remains staged until matching ACK/unknown evidence permits removal. Process-local bidirectional finalized identity tombstones and bounded early-order evidence reject conflicting late updates and prevent pre-ACK evidence from being stranded.
 
@@ -107,76 +121,70 @@ The existing runtime coordinator and manual-close maps remain active defense lay
 
 ## Current Problems
 
-There is no known P0 blocker for the current approximately 10 USDT, actively supervised, dedicated-sub-account scope. Important remaining limitations are:
+There is no known P0 blocker for the current approximately 10 USDT, actively supervised, dedicated-sub-account scope.
 
-- No real dedicated-sub-account end-to-end validation has been authorized or performed.
-- The Telegram latency change is verified with deterministic injected monitor/coordinator tests, not a real Telegram account; visibility still necessarily begins only after the raw MTProto update reaches this process.
-- The diagnostics presentation fix is verified with injected/pure tests and a renderer build; no real public-IP, Clash, or OKX endpoint probe was run in this task.
-- The ChatGPT quota fix is verified with injected Codex protocol/status results; no real account was deliberately exhausted or accessed in this task.
-- Cross-client unknown absence has no accepted safe automatic release rule. A replacement client that cannot find the order remains locked, even after repeated attempts or a position effect.
-- While recovered evidence remains nonterminal or absent, connection fails before the private WebSocket is established; the application cannot continuously observe the later terminal event in that recovery session.
-- The deterministic injected end-to-end crash harness in `TODO.md` is not yet built; current coverage is layered unit/integration-style mock coverage rather than filesystem-failure injection across every write primitive.
-- macOS/Linux native builds and runtime-license profiles are incomplete.
-- Windows application artifacts are not publisher-signed and use the default Electron icon.
+- The new Telegram cursor probe is verified only with injected transports. The user's real proxy/Telegram/ChatGPT path has not yet been retested, so roughly ten-second receipt/AI start is a target, not a confirmed private-service result.
+- The packaged Windows build passed native title-bar close/hide, process-retention, second-launch restoration, and minimized restoration checks. Explorer tray icon activation/menu, explicit orderly quit, and stale-icon cleanup still require the user's interactive installation test; macOS/Linux remain release-unverified.
+- Dynamic ChatGPT remaining-quota refresh is verified with an injected app-server transport only. A real authenticated account has not been observed across multiple cycles, so live Codex notification/snapshot timing remains integration-unverified.
+- No real dedicated-sub-account end-to-end validation has been authorized or performed. Telegram delivery, public/proxy diagnostics, deliberate ChatGPT exhaustion, and real OKX order behavior remain unverified against private services.
+- Cross-client unknown absence has an accepted evidence model but no enabled automatic release gate. A replacement client that sees no matching order remains locked even after repeated not-found results or a position effect, and the failed connection attempt does not keep a private WebSocket open for later terminal evidence. The reviewed OKX API contract has no finite maximum visibility delay or shared cross-endpoint snapshot revision.
+- Windows artifacts are unsigned/default-icon builds. macOS/Linux native packaging, runtime-license profiles, and cold starts remain unverified.
 
-Details and workarounds are authoritative in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md); executable work is in [`TODO.md`](TODO.md).
+All current limitations, failed approaches, and workarounds are authoritative in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md); executable completion criteria are in [`TODO.md`](TODO.md).
 
 ## Verification State
 
-The standard commands were rerun on 2026-08-24 on Windows/PowerShell:
+The standard local commands were rerun on 2026-08-26 on Windows/PowerShell after synchronizing the final `0.1.8` release identity. They use mocks/injected transports and made no private-service call:
 
 | Verification | Result |
 |---|---|
 | `npm.cmd run check:dependencies` | Passed: 16 installed production packages satisfy the reviewed policy |
 | `npm.cmd run typecheck` | Passed: node and renderer `tsc --noEmit` projects |
-| `npm.cmd test` | Passed: 12 files, 217 tests |
+| `npm.cmd test` | Passed: 13 files, 255 tests |
 | `npm.cmd run build` | Passed: dependency gate, typecheck, all three electron-vite outputs, and compiled-output provenance gate |
 | Lint | Not configured; `package.json` has no lint script |
-| `npm audit --omit=dev` | Passed: 0 known vulnerabilities |
-| `npm.cmd run package:win` | Passed: Windows x64 NSIS and portable ZIP generated; afterPack verified 16 packaged dependencies and runtime notices |
-| Windows artifact QA | Passed: ZIP fully extracted (103 files), ASAR version/entries and Codex binary verified, portable isolated cold start retained main/renderer and logged only `application_started` |
-| Windows signatures | Expected limitation confirmed: Setup and application are `NotSigned` |
-| Real Telegram/ChatGPT/OKX private integration | Not verified |
+| `npm audit --omit=dev` | Passed for the `v0.1.8` release candidate: 0 known vulnerabilities; required process-local system-CA/proxy variables after the first certificate-chain failure |
+| `npm.cmd run package:win` | Passed: Windows x64 NSIS installer and portable ZIP generated from final `0.1.8` source; afterPack verified 16 packaged dependencies and runtime notices |
+| Windows artifact QA | Passed: portable ZIP fully extracted to 103 files; ASAR package version/main and main/preload/renderer entries verified; Codex x64 binary and project/third-party/Electron/Chromium licenses present; isolated cold start logged only `application_started` |
+| Windows signatures | Expected limitation confirmed: Setup and application are `NotSigned`; bundled OpenAI Codex executable has a valid OpenAI signature |
+| Focused Telegram/coordinator verification | Passed: 3 files, 56 tests; missed-push preview at the first five-second tick, AI starts within the injected ten-second acceptance window, recovered message cannot order, stale/multi-message FIFO cases stay isolated, every new timeout is bounded, and stalled/old-generation work cannot strand or pollute the connection |
+| Focused tray lifecycle verification | Passed: 1 file, 9 tests; close-to-hide, no-tray fallback, minimized restore/focus, stable show/quit actions, repeated-quit blocking, startup-before-dispose ordering, and failed-cleanup finalization |
+| Focused ChatGPT quota verification | Passed: 1 file, 25 tests total; new coverage proves the one-minute cadence, bounded timeout/retry, last-trusted-value preservation, cross-trigger single-flight, logout pause, close isolation, exhaustion recovery without a message/notification, and polling after login |
+| Packaged Windows tray smoke test | Partially passed: isolated native run proved title-bar close hides while retaining the process, second launch restores the existing window, and a minimized window restores visibly; interactive Explorer tray icon/menu, explicit quit, and stale-icon cleanup remain for user testing |
+| Real Telegram/ChatGPT/OKX private integration | Not verified; the reported Telegram latency still needs user-environment re-test |
 | Real order open/close | Not verified |
 | macOS/Linux package and cold start | Not verified |
 
-Published `v0.1.7` artifact facts:
+Published `v0.1.8` asset facts (only these five files are public):
 
 | Asset | Size | SHA-256 |
 |---|---:|---|
-| `BWE.Auto.Trader-Setup-0.1.7-x64.exe` | 184,949,793 bytes | `0EF064BAC29EA536945931F4EE31C97522C363B8EB41CFCFDC1AB7A2B0C7FD8D` |
-| `BWE.Auto.Trader-Portable-0.1.7-x64.zip` | 263,889,413 bytes | `406D3B154FA957F81C931E8E5D2480BFF15A6C3930EA9C938724BA9652E635B8` |
+| `BWE.Auto.Trader-Setup-0.1.8-x64.exe` | 184,956,835 bytes | `1FDCC75692B59550C3579D51C505C0BD5FA052B7E214D32CBACB72A74BA0F170` |
+| `BWE.Auto.Trader-Portable-0.1.8-x64.zip` | 263,898,691 bytes | `58D1D45E72A4C8FAC6AF77EF05AF2AD384B551737E7DEA90270CC980504C78BF` |
+| `LICENSE` | 3,911 bytes | `E35451072886B5799DAC567F5764AEEC6BBD66D75068EA52169E3931263E886A` |
+| `SHA256SUMS.txt` | 207 bytes | `7DECDD0C2D73224777DB189142D2F09F483326C915BDF4559D096F37D41A5E90` |
+| `THIRD_PARTY_NOTICES.txt` | 8,098 bytes | `255884390691E7D3C3CCE170C561AB6114E414016520A4F651A6A95EE7966868` |
 
-The public asset names and hashes are recorded in the Release `SHA256SUMS.txt`. The package was not installed automatically because the QA machine already had a `v0.1.6` installation record; avoiding that overwrite preserved the existing installed state. The extracted portable package was cold-started instead.
-
-Published `v0.1.6` artifact facts retained from the prior release checkpoint:
-
-| Asset | Size | SHA-256 |
-|---|---:|---|
-| `BWE.Auto.Trader-Setup-0.1.6-x64.exe` | 185,013,251 bytes | `645B2A04979A22680BD9B64BDD36D473CD653828A30ADABE54E019A4A02825A3` |
-| `BWE.Auto.Trader-Portable-0.1.6-x64.zip` | 263,945,002 bytes | `9DA118C0A4F8BF62951706EE430174472BCB77E885417C0FA05210613A17F7E7` |
-
-The second table describes the superseded `v0.1.6` release only.
+`SHA256SUMS.txt` records the two executable archive hashes. `RELEASE_NOTES.md` is the GitHub Release body and was not uploaded as a duplicate asset. The package was not installed automatically because the QA machine already had a `v0.1.6` installation record; avoiding that overwrite preserved the existing installed state. The extracted portable package was cold-started instead.
 
 ## Git Workspace State
 
-At release completion, `main`, `origin/main`, and tag `v0.1.7` identify the same reviewed release commit. The tracked working tree is clean and there are no staged or untracked source changes.
+At the published checkpoint, local `main`, `origin/main`, and annotated tag `v0.1.8` point to the release commit and the tracked worktree is clean; use Git itself for the exact commit/tag object identities. The release commit includes all twenty-two previously modified tracked files plus the two formerly untracked tray source/test files. No private connection or real order occurred.
 
-`release-v0.1.7/` remains intentionally ignored and contains the exact local build outputs, release notes, checksums, builder metadata, and unpacked package used for publication. Historical artifacts, logs, existing local user-data folders, and `CODEX_CONTEXT.md` were not modified or deleted.
+`release-v0.1.8/` remains intentionally ignored. It contains the unpacked app, original space-named builder outputs, dotted publication copies, builder metadata, release notes, checksums, and copied licenses. Only the dotted Setup/Portable binaries plus `LICENSE`, `SHA256SUMS.txt`, and `THIRD_PARTY_NOTICES.txt` were uploaded explicitly. Never glob-upload this directory; `builder-debug.yml`, `latest.yml`, `.blockmap`, `win-unpacked/`, and `RELEASE_NOTES.md` are not public assets. Historical artifacts, existing local user-data folders, and `CODEX_CONTEXT.md` were not modified or deleted.
 
 ## Next Recommended Action
 
 For the next Thread:
 
-1. Read `AGENTS.md`, `docs/INDEX.md`, and this file; run `git status --short --branch` and confirm the `v0.1.7` checkpoint before changing code.
-2. Let the user test the public `v0.1.7` Setup/Portable assets, using `SHA256SUMS.txt` to verify them; collect concrete failures against the tagged release.
-3. After test feedback, either fix the reported issue or resume the P1 cross-client unknown-absence evidence model in [`TODO.md`](TODO.md). Do not replace the journal, replay a mutation, clear on one not-found result, or copy the same-origin 30-second rule to a replacement client.
-4. If the user authorizes the first real test, follow the dedicated-sub-account checklist in `TODO.md`; obtain explicit current-task authorization before any private connection or order.
-5. Do not edit the journal by hand, access private services, place orders, or publish another release without explicit authorization.
+1. Install or open the published Windows `v0.1.8` asset and verify tray icon activation, “显示主窗口”, explicit tray quit, process exit, and stale-icon cleanup. Confirm that hiding alone preserves monitoring/connections and does not imply emergency stop.
+2. With explicit ChatGPT authorization, observe the remaining-quota value across at least two one-minute cycles without relogin; confirm a real change propagates and logout stops updates without recording account/session data.
+3. Re-test several real target-channel posts after an idle interval only with explicit Telegram/ChatGPT authorization. The acceptance target is timeline visibility and AI start in roughly ten seconds or less; cursor-probe deliveries must remain visibly recovered and must never order.
+4. If those checks pass, record only non-sensitive results and continue the collection-only cross-client recovery task in [`TODO.md`](TODO.md). Preserve the journal and every fail-closed rule; do not replay a mutation, clear on replacement-client negative evidence, access private services, place orders, edit the journal by hand, commit, push, package, or publish without the corresponding authorization.
 
 ## New Thread Bootstrap
 
-1. Read `AGENTS.md`, `docs/INDEX.md`, and `docs/CURRENT_STATE.md`.
-2. Treat tagged and published `v0.1.7` as the current Windows x64 baseline; it includes the durable journal plus the Telegram visibility, diagnostics, and ChatGPT quota fixes.
-3. Run `git status --short --branch` and verify any drift against the tagged source, tests, and GitHub Release artifacts.
-4. Continue with the cross-client evidence design or a separately authorized real test; do not redo the completed journal, Telegram visibility, diagnostics, or ChatGPT quota implementations.
+1. Read `AGENTS.md`, then `docs/INDEX.md`, then this file.
+2. Read `docs/DECISIONS.md`, `docs/TODO.md`, and `docs/KNOWN_ISSUES.md` only for the task selected above.
+3. Treat published Windows x64 `v0.1.8` as the baseline and verify its exact Git/Release identities live before making new claims.
+4. Run `git status --short --branch`, preserve any later user work, and continue from `Next Recommended Action`.

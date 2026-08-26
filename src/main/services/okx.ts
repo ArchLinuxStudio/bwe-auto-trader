@@ -644,6 +644,21 @@ const MAX_OKX_RESPONSE_BYTES = 8 * 1024 * 1024
 const MAX_PROXY_RESPONSE_HEADER_BYTES = 64 * 1024
 const UNKNOWN_ORDER_ABSENCE_CONFIRMATION_MS = 30_000
 const MAX_PRIVATE_ORDER_DEDUP_KEYS = 10_000
+const OKX_PENDING_ORDER_PAGE_LIMIT = 100
+const OKX_SWAP_INSTRUMENT_ID_PATTERN = /^[A-Z0-9]{1,24}-[A-Z0-9]{1,24}-SWAP$/
+const OKX_ORDER_ID_PATTERN = /^[A-Za-z0-9]{1,64}$/
+const OKX_CLIENT_ORDER_ID_PATTERN = /^[A-Za-z0-9]{1,32}$/
+const OKX_DECIMAL_VALUE_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i
+const OKX_NORMAL_ORDER_STATES = new Set([
+  'live',
+  'partially_filled',
+  'filled',
+  'canceled',
+  'mmp_canceled'
+])
+const OKX_PENDING_ORDER_STATES = new Set(['live', 'partially_filled'])
+const OKX_POSITION_SIDES = new Set(['net', 'long', 'short'])
+const OKX_MARGIN_MODES = new Set(['isolated', 'cross'])
 const OKX_PENDING_ALGO_ORDER_TYPE_QUERIES = [
   'conditional,oco',
   'trigger',
@@ -1475,8 +1490,140 @@ function messageDataToString(data: unknown): string | undefined {
 }
 
 function isNonZeroPosition(position: OkxPosition): boolean {
-  const numericPosition = Number(position.pos)
-  return Number.isFinite(numericPosition) && numericPosition !== 0
+  if (!isFiniteOkxDecimal(position.pos)) return false
+  const significand = position.pos
+    .trim()
+    .replace(/^[+-]/, '')
+    .split(/[eE]/, 1)[0] ?? ''
+  return /[1-9]/.test(significand)
+}
+
+function normalizeNormalOrderState(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase().replace(/^cancelled$/, 'canceled')
+  return OKX_NORMAL_ORDER_STATES.has(normalized) ? normalized : undefined
+}
+
+function isOkxSwapInstrumentId(value: unknown): value is string {
+  return typeof value === 'string' && OKX_SWAP_INSTRUMENT_ID_PATTERN.test(value)
+}
+
+function isOkxOrderId(value: unknown): value is string {
+  return typeof value === 'string' && OKX_ORDER_ID_PATTERN.test(value)
+}
+
+function isOkxClientOrderId(value: unknown, allowEmpty = false): value is string {
+  if (typeof value !== 'string') return false
+  return (allowEmpty && value === '') || OKX_CLIENT_ORDER_ID_PATTERN.test(value)
+}
+
+function isFiniteOkxDecimal(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const normalized = value.trim()
+  return normalized.length > 0 &&
+    normalized.length <= 100 &&
+    OKX_DECIMAL_VALUE_PATTERN.test(normalized) &&
+    Number.isFinite(Number(normalized))
+}
+
+function normalizeOkxDecimalMagnitude(
+  value: string
+): { negative: boolean; magnitude: string } | undefined {
+  if (!isFiniteOkxDecimal(value)) return undefined
+  const normalized = value.trim()
+  return {
+    negative: normalized.startsWith('-'),
+    magnitude: normalized.replace(/^[+-]/, '')
+  }
+}
+
+function requirePendingSwapOrders(
+  orders: OkxOrder[],
+  expectedInstId?: string
+): OkxOrder[] {
+  if (orders.length >= OKX_PENDING_ORDER_PAGE_LIMIT) {
+    throw new OkxConfigurationError(
+      `OKX returned at least ${OKX_PENDING_ORDER_PAGE_LIMIT} pending SWAP orders; refusing to treat the result as complete`
+    )
+  }
+  return orders.map((order) => {
+    const state = normalizeNormalOrderState(order?.state)
+    if (
+      !order ||
+      order.instType !== 'SWAP' ||
+      !isOkxSwapInstrumentId(order.instId) ||
+      (expectedInstId !== undefined && order.instId !== expectedInstId) ||
+      !isOkxOrderId(order.ordId) ||
+      !isOkxClientOrderId(order.clOrdId, true) ||
+      !state ||
+      !OKX_PENDING_ORDER_STATES.has(state)
+    ) {
+      throw new OkxApiError(
+        'OKX returned an invalid pending SWAP order',
+        'INVALID_PENDING_ORDER'
+      )
+    }
+    return state === order.state ? order : { ...order, state }
+  })
+}
+
+function requireSwapPositions(
+  positions: OkxPosition[],
+  expectedInstId?: string
+): OkxPosition[] {
+  for (const position of positions) {
+    if (
+      !position ||
+      position.instType !== 'SWAP' ||
+      !isOkxSwapInstrumentId(position.instId) ||
+      (expectedInstId !== undefined && position.instId !== expectedInstId) ||
+      !isFiniteOkxDecimal(position.pos) ||
+      !OKX_POSITION_SIDES.has(position.posSide) ||
+      !OKX_MARGIN_MODES.has(position.mgnMode)
+    ) {
+      throw new OkxApiError(
+        'OKX returned an invalid SWAP position',
+        'INVALID_SWAP_POSITION'
+      )
+    }
+  }
+  return positions
+}
+
+function requireOrderDetails(
+  orders: OkxOrder[],
+  input: { instId: string; ordId?: string; clOrdId?: string }
+): OkxOrder | undefined {
+  if (orders.length > 1) {
+    throw new OkxApiError(
+      'OKX returned multiple results for one order identity',
+      'INVALID_ORDER_DETAILS'
+    )
+  }
+  if (orders.length === 0) return undefined
+  const order = orders[0]
+  if (!order || typeof order !== 'object') {
+    throw new OkxApiError(
+      'OKX returned invalid order details',
+      'INVALID_ORDER_DETAILS'
+    )
+  }
+  const state = normalizeNormalOrderState(order.state)
+  if (
+    order.instType !== 'SWAP' ||
+    order.instId !== input.instId ||
+    !isOkxOrderId(order.ordId) ||
+    !isOkxClientOrderId(order.clOrdId, input.ordId !== undefined) ||
+    !state ||
+    (input.ordId !== undefined && order.ordId !== input.ordId) ||
+    (input.clOrdId !== undefined && order.clOrdId !== input.clOrdId)
+  ) {
+    throw new OkxApiError(
+      'OKX returned invalid or conflicting order details',
+      'INVALID_ORDER_DETAILS'
+    )
+  }
+  return state === order.state ? order : { ...order, state }
 }
 
 function defaultWebSocketFactory(
@@ -1968,23 +2115,28 @@ export class OkxV5Client {
 
   async getPositions(instId?: string): Promise<OkxPosition[]> {
     const query: Record<string, string> = { instType: 'SWAP' }
-    if (instId) query.instId = normalizeInstrumentId(instId)
-    return this.privateRequest<OkxPosition>(
+    const normalizedInstId = instId ? normalizeInstrumentId(instId) : undefined
+    if (normalizedInstId) query.instId = normalizedInstId
+    const positions = await this.privateRequest<OkxPosition>(
       'GET',
       '/api/v5/account/positions',
       query
     )
+    return requireSwapPositions(positions)
   }
 
   /** Returns every live/uncompleted SWAP order in the dedicated sub-account. */
   async getPendingOrders(instId?: string): Promise<OkxOrder[]> {
     const query: Record<string, string> = { instType: 'SWAP' }
-    if (instId) query.instId = normalizeInstrumentId(instId)
-    return this.privateRequest<OkxOrder>(
+    const normalizedInstId = instId ? normalizeInstrumentId(instId) : undefined
+    if (normalizedInstId) query.instId = normalizedInstId
+    query.limit = String(OKX_PENDING_ORDER_PAGE_LIMIT)
+    const orders = await this.privateRequest<OkxOrder>(
       'GET',
       '/api/v5/trade/orders-pending',
       query
     )
+    return requirePendingSwapOrders(orders)
   }
 
   /**
@@ -2045,6 +2197,7 @@ export class OkxV5Client {
     ordId?: string
     clOrdId?: string
   }): Promise<OkxOrder | undefined> {
+    const instId = normalizeInstrumentId(input.instId)
     const ordId = input.ordId?.trim()
     const clOrdId = input.clOrdId?.trim()
     if (Boolean(ordId) === Boolean(clOrdId)) {
@@ -2052,15 +2205,24 @@ export class OkxV5Client {
         'Provide exactly one of ordId or clOrdId when querying an OKX order'
       )
     }
+    if (
+      (ordId !== undefined && !isOkxOrderId(ordId)) ||
+      (clOrdId !== undefined && !isOkxClientOrderId(clOrdId))
+    ) {
+      throw new OkxConfigurationError('OKX order query contains an invalid order identity')
+    }
     const data = await this.privateRequest<OkxOrder>(
       'GET',
       '/api/v5/trade/order',
       {
-        instId: normalizeInstrumentId(input.instId),
+        instId,
         ...(ordId ? { ordId } : { clOrdId: clOrdId! })
       }
     )
-    return data[0]
+    return requireOrderDetails(data, {
+      instId,
+      ...(ordId ? { ordId } : { clOrdId: clOrdId! })
+    })
   }
 
   /**
@@ -2094,13 +2256,14 @@ export class OkxV5Client {
           throw queryError
         }
       ),
-      this.getPositions(error.instId),
-      this.getPendingOrders(error.instId)
+      this.getPositions(error.instId).then((positions) =>
+        requireSwapPositions(positions, error.instId)
+      ),
+      this.getPendingOrders(error.instId).then((orders) =>
+        requirePendingSwapOrders(orders, error.instId)
+      )
     ])
-    const matchingOrder =
-      order?.instId === error.instId && order.clOrdId === error.clOrdId
-        ? order
-        : undefined
+    const matchingOrder = order
     const openPositions = positions.filter(
       (position) =>
         position.instId === error.instId && isNonZeroPosition(position)
@@ -2449,10 +2612,13 @@ export class OkxV5Client {
         `Cannot reduce ${instId}: account is not using net position mode`
       )
     }
-    const numericSize = Number(position.pos)
-    const size = position.pos.startsWith('-')
-      ? position.pos.slice(1)
-      : position.pos
+    const normalizedSize = normalizeOkxDecimalMagnitude(position.pos)
+    if (!normalizedSize) {
+      throw new OkxConfigurationError(
+        `Cannot reduce ${instId}: OKX returned an invalid position size`
+      )
+    }
+    const size = normalizedSize.magnitude
     const clOrdId = this.createClientOrderId()
     this.assertTradeTransmissionAllowed(armGeneration, expiresAt)
     const order = await this.submitIdentifiedOrder(
@@ -2462,7 +2628,7 @@ export class OkxV5Client {
       {
         instId,
         tdMode: 'isolated',
-        side: numericSize > 0 ? 'sell' : 'buy',
+        side: normalizedSize.negative ? 'buy' : 'sell',
         posSide: 'net',
         ordType: 'market',
         sz: size,
