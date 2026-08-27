@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">BWE Auto Trader application icon</title>
+  <rect x="64" y="64" width="896" height="896" rx="224" fill="#07110f"/>
+  <rect x="76" y="76" width="872" height="872" rx="212" fill="none" stroke="#173c31" stroke-width="24"/>
+  <circle cx="512" cy="512" r="320" fill="#38e8a1"/>
+  <path
+    d="M588 204 326 558h176l-64 266 270-377H536l52-243Z"
+    fill="#f7fffb"
+    stroke="#f7fffb"
+    stroke-linejoin="round"
+    stroke-width="12"
+  />
+</svg>

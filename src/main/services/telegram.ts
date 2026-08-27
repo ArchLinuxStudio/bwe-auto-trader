@@ -7,6 +7,7 @@ import { NewMessage, Raw, type NewMessageEvent } from 'teleproto/events/index.js
 import { UpdateConnectionState } from 'teleproto/network/index.js'
 import { ConnectionTCPFull } from 'teleproto/network/connection/index.js'
 import { StringSession } from 'teleproto/sessions/index.js'
+import { AuthKeyError, UnauthorizedError } from 'teleproto/errors/index.js'
 import type { Api } from 'teleproto'
 import type { SocketInterface } from 'teleproto/extensions/index.js'
 import type { TelegramClientParams } from 'teleproto/client/telegramBaseClient.js'
@@ -162,6 +163,15 @@ const MAX_RECOVERY_BUFFER_MESSAGES = 5_000
 const DEFAULT_STOP_DRAIN_TIMEOUT_MS = 2_000
 const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 5_000
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 4_000
+
+class TelegramAuthorizationLostError extends Error {
+  readonly code = 'TELEGRAM_AUTHORIZATION_LOST'
+
+  constructor() {
+    super('Telegram authorization is no longer valid')
+    this.name = 'TelegramAuthorizationLostError'
+  }
+}
 
 export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private client?: TelegramClient
@@ -824,7 +834,7 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
   private async healthCheckInternal(): Promise<void> {
     const client = this.client
     const channel = this.channelEntity
-    if (this.stopRequested || !client) return
+    if (this.stopRequested || !client || this.stateValue === 'error') return
     if (this.recoveryPromise) return
 
     if (!client.connected) {
@@ -982,28 +992,61 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     if (this.recoveryPromise) return this.recoveryPromise
 
     const recoveryClient = this.client
-    const operation = this.recoverConnection().catch((error) => {
-      // stop() has a bounded drain and a later start may already own a new
-      // client when this old operation finally rejects. Never let that stale
-      // failure mutate the new monitor generation.
-      if (!this.stopRequested && this.client === recoveryClient) {
-        if (isLikelyProxyOrNetworkError(error)) this.forceReconnectOnRecovery = true
-        this.disconnectedChecks = Math.min(
-          DISCONNECT_CONFIRMATION_CHECKS,
-          Math.max(1, this.disconnectedChecks) + 1,
-        )
-        if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
-          this.publishConfirmedReconnect('Telegram recovery could not be verified')
+    let recoveryCompleted = false
+    const operation = this.recoverConnection()
+      .then(() => {
+        recoveryCompleted = true
+      })
+      .catch((error) => {
+        const normalizedError =
+          error instanceof TelegramAuthorizationLostError
+            ? error
+            : error instanceof UnauthorizedError || error instanceof AuthKeyError
+              ? new TelegramAuthorizationLostError()
+              : error
+        // stop() has a bounded drain and a later start may already own a new
+        // client when this old operation finally rejects. Never let that stale
+        // failure mutate the new monitor generation.
+        if (!this.stopRequested && this.client === recoveryClient) {
+          if (normalizedError instanceof TelegramAuthorizationLostError) {
+            this.reconnecting = false
+            this.clearHealthTimer()
+            this.clearRecoveryConfirmationTimer()
+            this.setState('error', normalizedError.message)
+            void this.reportError(normalizedError, false)
+          } else {
+            if (isLikelyProxyOrNetworkError(normalizedError)) this.forceReconnectOnRecovery = true
+            this.disconnectedChecks = Math.min(
+              DISCONNECT_CONFIRMATION_CHECKS,
+              Math.max(1, this.disconnectedChecks) + 1,
+            )
+            if (this.disconnectedChecks >= DISCONNECT_CONFIRMATION_CHECKS) {
+              this.publishConfirmedReconnect('Telegram recovery could not be verified')
+            }
+            // Recovery state is already closed/published. Keep diagnostics outside
+            // the recovery Promise so a broken listener cannot block the retry.
+            void this.reportError(normalizedError, true)
+          }
         }
-        // Recovery state is already closed/published. Keep diagnostics outside
-        // the recovery Promise so a broken listener cannot block the retry.
-        void this.reportError(error, true)
-      }
-      throw error
-    })
+        throw normalizedError
+      })
     let tracked: Promise<void>
     tracked = operation.finally(() => {
-      if (this.recoveryPromise === tracked) this.recoveryPromise = undefined
+      if (this.recoveryPromise !== tracked) return
+      this.recoveryPromise = undefined
+      if (
+        recoveryCompleted &&
+        !this.stopRequested &&
+        this.client === recoveryClient &&
+        recoveryClient?.connected === true &&
+        this.stateValue === 'reconnecting' &&
+        !this.recoveryPending &&
+        !this.reconnecting
+      ) {
+        // Publish recovery only after the single-flight promise is cleared, so
+        // the connected callback observes liveTradingReadiness.ready === true.
+        this.setState('connected', `Reconnected to @${this.channelUsername}`)
+      }
     })
     this.recoveryPromise = tracked
     return tracked
@@ -1052,17 +1095,12 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     // negative update invalidates the catch-up window.
     const recoveryRevision = this.recoveryRevision
     const caughtUpMessages = await this.collectCatchUpMessages(recoveryCursor)
-    const authorizationStillValid = client.connected && (await resolveWithin(
-      client.checkAuthorization(),
-      this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
-      'Telegram recovery authorization probe timed out',
-    ))
+    await this.verifyRecoveryAuthorization(client)
     if (
       this.stopRequested ||
       this.client !== client ||
       recoveryRevision !== this.recoveryRevision ||
-      !client.connected ||
-      !authorizationStillValid
+      !client.connected
     ) {
       throw new Error('Telegram connection changed while recovery was being verified')
     }
@@ -1081,7 +1119,6 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
     this.clearRecoveryConfirmationTimer()
     this.recoveryFromMessageId = undefined
     this.disconnectedChecks = 0
-    const reconnectWasPublished = this.stateValue === 'reconnecting'
     this.reconnecting = false
     // Append the entire recovered range to the FIFO in one synchronous turn.
     // A live NewMessage callback cannot interleave a newer id between two
@@ -1094,12 +1131,45 @@ export class TelegramMonitor extends EventEmitter<TelegramEventMap> {
         message.authorizationToken,
       ),
     )
-    if (reconnectWasPublished) {
-      this.setState('connected', `Reconnected to @${this.channelUsername}`)
-    }
-
     await Promise.all(recoveryDispatches)
     await this.persistSession().catch((error) => this.reportError(error, true))
+  }
+
+  private async verifyRecoveryAuthorization(client: TelegramClient): Promise<void> {
+    const timeoutMs = this.options.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+    const directApi = (client as unknown as {
+      api?: { updates?: { getState(): Promise<unknown> } }
+    }).api
+
+    if (directApi?.updates?.getState) {
+      try {
+        // TelegramClient.checkAuthorization() intentionally collapses every
+        // updates.getState failure—including network errors—to false. Use the
+        // underlying typed RPC so only an explicit auth-key/session error is
+        // fatal; timeouts and transport failures stay in the reconnect loop.
+        await resolveWithin(
+          directApi.updates.getState(),
+          timeoutMs,
+          'Telegram recovery authorization probe timed out',
+        )
+      } catch (error) {
+        if (error instanceof UnauthorizedError || error instanceof AuthKeyError) {
+          throw new TelegramAuthorizationLostError()
+        }
+        throw error
+      }
+      return
+    }
+
+    // Minimal injected transports used by unit tests predate teleproto's typed
+    // API facade. Production TelegramClient instances always take the direct
+    // RPC branch above and therefore preserve the original failure category.
+    const authorized = await resolveWithin(
+      client.checkAuthorization(),
+      timeoutMs,
+      'Telegram recovery authorization probe timed out',
+    )
+    if (!authorized) throw new TelegramAuthorizationLostError()
   }
 
   private bufferRecoveryMessage(

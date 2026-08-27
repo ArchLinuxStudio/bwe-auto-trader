@@ -64,7 +64,7 @@ const EMPTY_SETTINGS: PublicSettings = {
 }
 
 const EMPTY_SNAPSHOT: AppSnapshot = {
-  version: '0.1.8',
+  version: '0.1.9',
   connections: {
     telegram: EMPTY_STATUS,
     chatgpt: EMPTY_STATUS,
@@ -309,6 +309,8 @@ function App(): JSX.Element {
   const connectedCount = Object.values(snapshot.connections).filter(
     (connection) => connection.phase === 'connected',
   ).length
+  const telegramLiveSuspended =
+    snapshot.safety.liveArmed && snapshot.connections.telegram.phase === 'connecting'
 
   if (loading) {
     return <LoadingScreen />
@@ -347,14 +349,16 @@ function App(): JSX.Element {
 
         <div className="sidebar-spacer" />
 
-        <div className={`mode-card ${snapshot.safety.liveArmed ? 'armed' : ''}`}>
+        <div className={`mode-card ${telegramLiveSuspended ? 'suspended' : snapshot.safety.liveArmed ? 'armed' : ''}`}>
           <div className="mode-card-top">
             <span className="eyebrow">执行模式</span>
-            <span className={`pulse-dot ${snapshot.safety.liveArmed ? 'danger' : 'safe'}`} />
+            <span className={`pulse-dot ${telegramLiveSuspended ? 'warning' : snapshot.safety.liveArmed ? 'danger' : 'safe'}`} />
           </div>
-          <strong>{snapshot.safety.liveArmed ? '实盘已解锁' : '安全锁定'}</strong>
+          <strong>{telegramLiveSuspended ? '实盘重连中' : snapshot.safety.liveArmed ? '实盘已解锁' : '安全锁定'}</strong>
           <p>
-            {snapshot.safety.liveArmed
+            {telegramLiveSuspended
+              ? '恢复校验期间不会下单，成功后自动继续'
+              : snapshot.safety.liveArmed
               ? '符合风控的信号将提交真实订单'
               : '分析照常运行，不会提交真实订单'}
           </p>

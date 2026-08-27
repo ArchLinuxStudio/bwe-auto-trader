@@ -196,6 +196,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private monitoringRevision = 0
   private telegramLifecycleRevision = 0
   private liveArmCapability?: object
+  private telegramReconnectRetainedArm = false
   private emergencyStopped = false
   private armedAt?: number
   private aiModel?: string
@@ -452,14 +453,31 @@ export class AppController extends EventEmitter<ControllerEvents> {
     // Authentication can require a second IPC call for OTP/2FA. Do not keep
     // the initial connect IPC pending or the renderer would be unable to submit
     // that prompt while its connect action is busy.
-    if (this.telegram) return
+    const existingMonitor = this.telegram
+    if (existingMonitor) {
+      if (existingMonitor.state !== 'error' && existingMonitor.state !== 'stopped') return
+      this.telegram = undefined
+      this.telegramLifecycleRevision += 1
+      const disarm = this.disarmLiveTrading(
+        'Telegram 错误连接正在重建，已保持锁定；恢复后需人工重新确认实盘'
+      ).catch(() => undefined)
+      await this.coordinator.finalizePendingRecoveryObservations(
+        'Telegram 错误连接已替换，等待连续性校验的消息未进入 AI 分析'
+      ).catch(() => undefined)
+      await existingMonitor.stop().catch(() => undefined)
+      await disarm
+      // Another connect request may have installed a replacement while the
+      // obsolete monitor performed its bounded stop.
+      if (this.telegram) return
+    }
     const apiId = this.settings.telegramApiId
     const stored = await this.readJsonSecret<{ apiHash: string; phoneNumber: string }>(
       TELEGRAM_CREDENTIALS_KEY
     )
     if (!apiId || !stored?.apiHash || !stored.phoneNumber) throw new Error('请先保存 Telegram API 凭据')
     this.setConnection('telegram', 'connecting', `正在通过 Clash 连接 @${this.settings.trading.channelUsername}`)
-    const monitor = new TelegramMonitor({
+    let monitor!: TelegramMonitor
+    monitor = new TelegramMonitor({
       apiId,
       apiHash: stored.apiHash,
       channel: normalizeChannelUsername(this.settings.trading.channelUsername),
@@ -469,18 +487,22 @@ export class AppController extends EventEmitter<ControllerEvents> {
       auth: { phoneNumber: stored.phoneNumber },
       captureAuthorization: () => this.currentSignalTradeAuthorization(),
       callbacks: {
-        onStatus: (status) => this.handleTelegramStatus(status),
-        onAuthRequired: (request) => this.createTelegramPrompt(request),
+        onStatus: (status) => this.handleTelegramStatus(monitor, status),
+        onAuthRequired: (request) => {
+          if (this.telegram === monitor) this.createTelegramPrompt(request)
+        },
         onMessageObserved: async (message) => {
+          if (this.telegram !== monitor) return
           await this.coordinator.observeRecovered(toTelegramMessagePayload(message))
         },
         onMessage: async (message, context) => {
+          if (this.telegram !== monitor) return
           await this.coordinator.process(
             toTelegramMessagePayload(message),
             context.authorizationToken
           )
         },
-        onError: (event) => this.handleTelegramError(event)
+        onError: (event) => this.handleTelegramError(monitor, event)
       }
     })
     this.telegram = monitor
@@ -503,15 +525,16 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.setConnection('telegram', 'connected', `已连接并守候 @${monitor.channelUsername}`)
       await this.audit.write('telegram_connected', 'info', { channel: monitor.channelUsername })
     } catch (error) {
+      if (this.telegram !== monitor) return
       const disarm = this.disarmLiveTrading('Telegram 连接失败，已锁定实盘').catch(() => undefined)
-      if (this.telegram === monitor) {
-        this.telegram = undefined
-        this.telegramLifecycleRevision += 1
-        await this.coordinator.finalizePendingRecoveryObservations(
-          'Telegram 连接失败，等待连续性校验的消息未进入 AI 分析'
-        ).catch(() => undefined)
-      }
+      this.telegram = undefined
+      this.telegramLifecycleRevision += 1
+      const failedLifecycleRevision = this.telegramLifecycleRevision
+      await this.coordinator.finalizePendingRecoveryObservations(
+        'Telegram 连接失败，等待连续性校验的消息未进入 AI 分析'
+      ).catch(() => undefined)
       await disarm
+      if (this.telegram || this.telegramLifecycleRevision !== failedLifecycleRevision) return
       this.setConnection('telegram', 'error', errorText(error))
       await this.notify('error', 'Telegram 连接失败', errorText(error))
     }
@@ -522,6 +545,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     const monitor = this.telegram
     this.telegram = undefined
     if (monitor) this.telegramLifecycleRevision += 1
+    const disconnectedLifecycleRevision = this.telegramLifecycleRevision
     // stopMonitoring flips monitoring/liveArmed synchronously before its first
     // await, so any already-running AI callback is fail-closed while the
     // transport performs its bounded drain.
@@ -530,6 +554,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
       monitor.cancelAuthentication('用户断开 Telegram')
       await monitor.stop().catch(() => undefined)
     }
+    if (this.telegram || this.telegramLifecycleRevision !== disconnectedLifecycleRevision) return
     this.setConnection(
       'telegram',
       this.settings?.telegramConfigured ? 'disconnected' : 'not_configured',
@@ -1279,15 +1304,50 @@ export class AppController extends EventEmitter<ControllerEvents> {
     }
   }
 
-  private handleTelegramStatus(status: TelegramStatusEvent): void {
-    if (status.state !== 'connected') {
+  private handleTelegramStatus(source: TelegramMonitor, status: TelegramStatusEvent): void {
+    if (this.closing || this.telegram !== source) return
+    if (status.state === 'connected' && !source.liveTradingReadiness.ready) {
+      void this.disarmLiveTrading(
+        'Telegram 报告已连接但恢复门禁尚未就绪，已保持锁定；请重新连接并人工确认实盘'
+      ).catch(() => undefined)
+      this.setConnection('telegram', 'error', '连接恢复校验尚未完成')
+      return
+    }
+
+    const retainLiveArm =
+      status.state === 'reconnecting' &&
+      this.monitoring &&
+      this.liveArmed &&
+      Boolean(this.liveArmCapability)
+    const newlySuspendedRetainedArm = retainLiveArm && !this.telegramReconnectRetainedArm
+    if (newlySuspendedRetainedArm) {
+      this.telegramReconnectRetainedArm = true
+    } else if (status.state !== 'connected' && status.state !== 'reconnecting') {
       const detail = status.detail ? `（${status.detail}）` : ''
       void this.disarmLiveTrading(
         `Telegram 状态变为 ${status.state}${detail}，已锁定实盘；连接恢复后需人工重新确认`
       ).catch(() => undefined)
     }
     if (status.state === 'connected') {
+      const resumedRetainedArm =
+        this.telegramReconnectRetainedArm &&
+        this.monitoring &&
+        this.liveArmed &&
+        Boolean(this.liveArmCapability)
+      this.telegramReconnectRetainedArm = false
       this.setConnection('telegram', 'connected', status.detail ?? '频道连接正常')
+      if (resumedRetainedArm) {
+        void this.audit.write('telegram_reconnect_live_resumed', 'warning', {
+          monitoringRevision: this.monitoringRevision,
+          armRevision: this.liveArmRevision,
+          recoveryRevision: source.liveTradingReadiness.revision
+        }).catch(() => undefined)
+        void this.notify(
+          'success',
+          'Telegram 已恢复',
+          '消息连续性与登录授权校验已通过；仅恢复后新到达的消息可继续触发实盘'
+        ).catch(() => undefined)
+      }
     } else if (
       status.state === 'connecting' ||
       status.state === 'authenticating' ||
@@ -1299,15 +1359,30 @@ export class AppController extends EventEmitter<ControllerEvents> {
     } else {
       this.setConnection('telegram', 'disconnected', status.detail ?? status.state)
     }
+    if (newlySuspendedRetainedArm) {
+      void this.audit.write('telegram_reconnect_live_suspended', 'warning', {
+        monitoringRevision: this.monitoringRevision,
+        armRevision: this.liveArmRevision
+      }).catch(() => undefined)
+      void this.notify(
+        'warning',
+        'Telegram 正在自动重连',
+        '网络恢复与消息连续性校验期间不会下单；校验成功后将自动继续实盘监听'
+      ).catch(() => undefined)
+    }
     if (status.proxyProtocol) {
       this.diagnostics = { ...this.diagnostics, proxyProtocol: status.proxyProtocol }
     }
   }
 
-  private async handleTelegramError(event: TelegramMonitorError): Promise<void> {
+  private async handleTelegramError(
+    source: TelegramMonitor,
+    event: TelegramMonitorError
+  ): Promise<void> {
+    if (this.closing || this.telegram !== source) return
     // Recoverable teleproto errors are diagnostic signals only. Confirmed
     // transport changes are published through handleTelegramStatus(), which
-    // remains the single authority that revokes live trading.
+    // remains the single authority that suspends or revokes live trading.
     if (!event.recoverable) {
       this.lastError = event.message
       await this.disarmLiveTrading(
@@ -2423,6 +2498,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private invalidateOkxOpeningCapability(): void {
     this.liveArmRevision += 1
     this.liveArmCapability = undefined
+    this.telegramReconnectRetainedArm = false
     this.liveArmed = false
     this.armedAt = undefined
     if (this.okx && this.okx !== this.closeScopedArmedClient) {

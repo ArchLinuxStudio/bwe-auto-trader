@@ -230,9 +230,9 @@ function createTray(): boolean {
   }
 }
 
-// A compact transparent 32px application glyph keeps tray behavior independent
-// of platform packaging resources, which currently still use Electron's default
-// unsigned application icon.
+// Keep the compact transparent 32px tray glyph embedded so tray startup remains
+// independent of platform packaging resources. The packaged application icon is
+// generated separately from build/icon.svg.
 const TRAY_ICON_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAnUlEQVR42u2XsQ2AMAwE07EQDSXrsSEbMAFtaBFF8Nvv5IWw5DZ3SmzLKeUPIJZ9q5YcBqaLPA+c1tmUFBEPuCWSBj/qyZVA4W8CsARy7VaBuwQdTpUYKhCBWwWaEmjhyQlYxUICUXhXAfoTMOBuARacUoTRdkwV6NKGEXjaNKTAJQQ8E5EKRxYSD5y2FaXCJZZSibVc4mMi8zX7dFxmzm+M0aNOZQAAAABJRU5ErkJggg=='
 

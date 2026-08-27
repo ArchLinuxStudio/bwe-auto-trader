@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "appVersion": "0.1.8",
+  "appVersion": "0.1.9",
   "noticesPath": "THIRD_PARTY_NOTICES.txt",
   "scope": "Production dependency closure for supported win32, darwin, and linux x64/arm64 packages. Exactly one platform-specific @openai/codex package is selected for a built target.",
   "packages": [

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { UpdateConnectionState } from 'teleproto/network/index.js'
+import { UnauthorizedError } from 'teleproto/errors/index.js'
 
 import {
   TelegramMonitor,
@@ -34,7 +35,7 @@ interface TelegramMonitorHarness {
   recoveryFromMessageId?: number
   recoveryPromise?: Promise<void>
   liveTradingReadiness: { ready: boolean; revision: number }
-  stateValue: 'idle' | 'connected' | 'reconnecting'
+  stateValue: 'idle' | 'connected' | 'reconnecting' | 'error'
   client?: {
     connected: boolean
     getMessages: (...args: unknown[]) => Promise<unknown[]>
@@ -63,7 +64,11 @@ function createMonitor(
     message: TelegramSignalMessage,
     context: TelegramMessageDispatchContext,
   ) => void | Promise<void>,
-  onError?: (error: { message: string }) => void | Promise<void>,
+  onError?: (error: {
+    message: string
+    code?: string
+    recoverable: boolean
+  }) => void | Promise<void>,
   onStatus?: (status: TelegramStatusEvent) => void | Promise<void>,
   monitorOptions: Partial<Pick<
     TelegramMonitorOptions,
@@ -828,6 +833,9 @@ describe('TelegramMonitor message dispatch', () => {
     const client = {
       connected: false,
       getMessages: vi.fn(async () => []),
+      disconnect: vi.fn(async () => {
+        client.connected = false
+      }),
       connect: vi.fn(async () => {
         client.connected = true
       }),
@@ -848,6 +856,205 @@ describe('TelegramMonitor message dispatch', () => {
     expect(statuses).toEqual(['reconnecting', 'connected'])
     expect(harness.disconnectedChecks).toBe(0)
     expect(harness.reconnecting).toBe(false)
+  })
+
+  it('keeps retrying failed network reconnects until a later health check succeeds', async () => {
+    const statuses: string[] = []
+    const readinessAtConnected: boolean[] = []
+    let harness!: TelegramMonitorHarness
+    const created = createMonitor(
+      () => undefined,
+      undefined,
+      (status) => {
+        statuses.push(status.state)
+        if (status.state === 'connected') {
+          readinessAtConnected.push(harness.liveTradingReadiness.ready)
+        }
+      },
+    )
+    harness = created.harness
+    let connectAttempts = 0
+    const client = {
+      connected: false,
+      getMessages: vi.fn(async () => []),
+      disconnect: vi.fn(async () => {
+        client.connected = false
+      }),
+      connect: vi.fn(async () => {
+        connectAttempts += 1
+        if (connectAttempts < 3) throw new Error('network connection unavailable')
+        client.connected = true
+      }),
+      checkAuthorization: vi.fn(async () => true),
+    }
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = client
+
+    await harness.healthCheck()
+    await harness.healthCheck()
+    await harness.healthCheck()
+
+    expect(client.connect).toHaveBeenCalledTimes(2)
+    expect(client.disconnect).toHaveBeenCalledOnce()
+    expect(statuses).toEqual(['reconnecting'])
+    expect(harness.recoveryPending).toBe(true)
+    expect(harness.stateValue).toBe('reconnecting')
+
+    await harness.healthCheck()
+
+    expect(client.connect).toHaveBeenCalledTimes(3)
+    expect(client.disconnect).toHaveBeenCalledTimes(2)
+    expect(client.getMessages).toHaveBeenCalledOnce()
+    expect(client.checkAuthorization).toHaveBeenCalledOnce()
+    expect(statuses).toEqual(['reconnecting', 'connected'])
+    expect(readinessAtConnected).toEqual([true])
+    expect(harness.recoveryPending).toBe(false)
+    expect(harness.recoveryPromise).toBeUndefined()
+    expect(harness.liveTradingReadiness.ready).toBe(true)
+  })
+
+  it('treats an explicitly revoked recovery authorization as fatal instead of retrying', async () => {
+    const statuses: string[] = []
+    const errors: Array<{ code?: string; recoverable: boolean }> = []
+    const getState = vi.fn(async () => {
+      throw new UnauthorizedError('AUTH_KEY_UNREGISTERED', undefined as never, 401)
+    })
+    const client = {
+      connected: false,
+      getMessages: vi.fn(async () => []),
+      connect: vi.fn(async () => {
+        client.connected = true
+      }),
+      checkAuthorization: vi.fn(async () => true),
+      api: { updates: { getState } },
+    }
+    const { harness } = createMonitor(
+      () => undefined,
+      (error) => {
+        errors.push({ code: error.code, recoverable: error.recoverable })
+      },
+      (status) => {
+        statuses.push(status.state)
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = client
+
+    await harness.healthCheck()
+    await harness.healthCheck()
+
+    expect(statuses).toEqual(['reconnecting', 'error'])
+    expect(errors).toEqual([{
+      code: 'TELEGRAM_AUTHORIZATION_LOST',
+      recoverable: false,
+    }])
+    expect(harness.stateValue).toBe('error')
+    expect(harness.recoveryPromise).toBeUndefined()
+    expect(harness.liveTradingReadiness.ready).toBe(false)
+
+    await harness.healthCheck()
+    expect(client.connect).toHaveBeenCalledOnce()
+    expect(getState).toHaveBeenCalledOnce()
+    expect(client.checkAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('treats authorization loss during catch-up as fatal before the final auth probe', async () => {
+    const statuses: string[] = []
+    const errors: Array<{ code?: string; recoverable: boolean }> = []
+    const getState = vi.fn(async () => ({}))
+    const client = {
+      connected: false,
+      getMessages: vi.fn(async () => {
+        throw new UnauthorizedError('AUTH_KEY_UNREGISTERED', undefined as never, 401)
+      }),
+      connect: vi.fn(async () => {
+        client.connected = true
+      }),
+      checkAuthorization: vi.fn(async () => true),
+      api: { updates: { getState } },
+    }
+    const { harness } = createMonitor(
+      () => undefined,
+      (error) => {
+        errors.push({ code: error.code, recoverable: error.recoverable })
+      },
+      (status) => {
+        statuses.push(status.state)
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = client
+
+    await harness.healthCheck()
+    await harness.healthCheck()
+
+    expect(statuses).toEqual(['reconnecting', 'error'])
+    expect(errors).toEqual([{
+      code: 'TELEGRAM_AUTHORIZATION_LOST',
+      recoverable: false,
+    }])
+    expect(harness.stateValue).toBe('error')
+    expect(harness.recoveryPromise).toBeUndefined()
+    expect(harness.liveTradingReadiness.ready).toBe(false)
+    expect(getState).not.toHaveBeenCalled()
+
+    await harness.healthCheck()
+    expect(client.connect).toHaveBeenCalledOnce()
+    expect(client.getMessages).toHaveBeenCalledOnce()
+    expect(client.checkAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('retries a network failure from the direct authorization RPC', async () => {
+    const statuses: string[] = []
+    const recoverableErrors: boolean[] = []
+    const getState = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network connection closed during auth probe'))
+      .mockResolvedValueOnce({})
+    const client = {
+      connected: false,
+      getMessages: vi.fn(async () => []),
+      disconnect: vi.fn(async () => {
+        client.connected = false
+      }),
+      connect: vi.fn(async () => {
+        client.connected = true
+      }),
+      checkAuthorization: vi.fn(async () => true),
+      api: { updates: { getState } },
+    }
+    const { harness } = createMonitor(
+      () => undefined,
+      (error) => {
+        recoverableErrors.push(error.recoverable)
+      },
+      (status) => {
+        statuses.push(status.state)
+      },
+    )
+    harness.stateValue = 'connected'
+    harness.channelEntity = {}
+    harness.client = client
+
+    await harness.healthCheck()
+    await harness.healthCheck()
+
+    expect(statuses).toEqual(['reconnecting'])
+    expect(recoverableErrors).toEqual([true])
+    expect(harness.stateValue).toBe('reconnecting')
+    expect(harness.recoveryPending).toBe(true)
+    expect(harness.liveTradingReadiness.ready).toBe(false)
+
+    await harness.healthCheck()
+
+    expect(statuses).toEqual(['reconnecting', 'connected'])
+    expect(getState).toHaveBeenCalledTimes(2)
+    expect(client.checkAuthorization).not.toHaveBeenCalled()
+    expect(harness.recoveryPending).toBe(false)
+    expect(harness.liveTradingReadiness.ready).toBe(true)
   })
 
   it('accepts a later successful internal connect attempt after a transient disconnected update', async () => {

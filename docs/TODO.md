@@ -16,22 +16,15 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
     - Confirm logout stops polling and quota recovery does not automatically re-arm live trading.
   - Done when the authenticated UI changes without reconnecting and only non-sensitive timing/value behavior is recorded in `docs/CURRENT_STATE.md`.
 
-- [ ] Complete the user-facing tray-menu and Explorer cleanup check in the published Windows `v0.1.8` package.
-  - Verified locally: The isolated packaged portable build keeps the process alive after title-bar close, hides the window, restores the same process from a second launch, and restores a minimized window. It made no private-service connection.
-  - Dependency: The remaining steps require an interactive Explorer tray check after the user installs or opens `v0.1.8`.
-  - Scope:
-    - Confirm the tray icon is visible after cold start and tray activation plus “显示主窗口” restore the existing window.
-    - Confirm “退出 BWE Auto Trader” ends the process only after the normal controller cleanup path, and no orphan tray icon remains.
-    - Confirm the tray-unavailable fallback on any platform where native shell integration cannot be established; do not claim macOS/Linux behavior from Windows results.
-  - Done when the remaining interactive Windows behavior passes and the non-sensitive result is recorded in `docs/CURRENT_STATE.md`.
-
 - [ ] Re-verify Telegram target-channel receipt and AI-start latency in the user's real environment.
-  - Dependency: Install or open `v0.1.8`; Codex must not access a private Telegram session or ChatGPT login without explicit authorization in that current Thread.
+  - Dependency: Use the reviewed `v0.1.9` Windows package or a later build. Codex must not access a private Telegram session or ChatGPT login without explicit authorization in that current Thread.
   - Scope:
     - Test several new channel posts after an idle period while the application remains visibly connected.
     - Compare the channel publication time with the first timeline `received` state and the first `analyzing` state; retain only non-sensitive aggregate timing.
     - Confirm that a cursor-probe recovery is marked recovered and never submits an order, even if the post is recent and live trading was armed.
-  - Done when repeated healthy-path or cursor-recovery posts begin AI in roughly ten seconds or less, no message waits near the previously observed two minutes, and the verified environment/result is recorded without secrets.
+    - While no real order is permitted, simulate a temporary network interruption and confirm the application remains in automatic `reconnecting`, retries without restarting monitoring, and returns to `connected` after the network recovers.
+    - Confirm recovery/catch-up messages remain non-trading and a later new live message is delivered normally after recovery. Retained-arm trading eligibility is covered by the injected no-order harness; do not claim it as real-environment verified without a separately authorized three-service safety test.
+  - Done when repeated healthy-path or cursor-recovery posts begin AI in roughly ten seconds or less, no message waits near the previously observed two minutes, network recovery resumes listening without manual restart, and the verified environment/result is recorded without secrets.
 
 - [ ] Perform the first user-supervised dedicated-sub-account end-to-end test.
   - Scope:
@@ -65,11 +58,15 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
     - Linux x64 and arm64 AppImage/deb as currently configured.
   - Done when for each claimed target:
     - `licenses/third-party-manifest.json` has an exact reviewed Electron/runtime profile and evidence hashes.
-    - Dependency gate, build, native afterPack, archive/install, secure storage, proxy, Codex binary, UI, and isolated cold start pass on a native runner.
+    - Dependency gate, build, native afterPack, archive/install, secure storage, proxy, Codex binary, UI, isolated cold start, native tray lifecycle, and tray-unavailable close-to-exit fallback pass on a native runner.
     - Platform signing/notarization status is stated accurately.
     - `README.md` and `docs/CURRENT_STATE.md` are updated without extrapolating Windows results.
 
 ## P2 — Product and operational improvements
+
+- [ ] Serialize Telegram connect attempts in the main process.
+  - Relevant code: `src/main/app-controller.ts`.
+  - Done when a lifecycle reservation or single-flight prevents two concurrent `connectTelegram()` calls from constructing competing monitors, disconnect can cancel an in-flight connect, and a late loser is bounded-stopped without changing connection state or trading authorization.
 
 - [ ] Display unresolved-operation provenance from the durable mutation journal.
   - Dependency: Read the existing `mutation-journal.v1.json` through the main-process store; do not create a second provenance store or expose the hashed account identity.
@@ -82,8 +79,8 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
 - [ ] Explain live-lock revocation when saving identical OKX credentials.
   - Done when the user receives a clear reason that lifecycle reservation revoked authorization even though the account identity did not change.
 
-- [ ] Configure application identity and signing.
-  - Done when a non-default application icon is packaged, Windows installer/application publisher signatures verify, and the documented macOS targets have Developer ID signing/notarization when published.
+- [ ] Configure application publisher signing.
+  - Done when Windows installer/application publisher signatures verify and the documented macOS targets have Developer ID signing/notarization when published.
 
 - [ ] Add an explicit, redacted log export and reconciliation report.
   - Done when exported diagnostics exclude all configured secret/session/token fields and give the user enough `clOrdId`/route/lifecycle context to investigate an unknown order.

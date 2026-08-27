@@ -37,16 +37,20 @@ import type { AppPosition, SignalRecord, TelegramMessagePayload } from '../../sr
 
 const temporaryDirectories: string[] = []
 
-function installReadyTelegram(controller: AppController): void {
-  ;(controller as unknown as {
-    telegram?: {
-      readonly liveTradingReadiness: { ready: boolean; revision: number }
-      stop(): Promise<void>
-    }
-  }).telegram = {
+interface ReadyTelegramStub {
+  liveTradingReadiness: { ready: boolean; revision: number }
+  stop(): Promise<void>
+}
+
+function installReadyTelegram(controller: AppController): ReadyTelegramStub {
+  const telegram: ReadyTelegramStub = {
     liveTradingReadiness: { ready: true, revision: 0 },
     stop: vi.fn(async () => undefined)
   }
+  ;(controller as unknown as {
+    telegram?: ReadyTelegramStub
+  }).telegram = telegram
+  return telegram
 }
 
 function captureSignalAuthorization(
@@ -66,6 +70,37 @@ afterEach(async () => {
 })
 
 describe('AppController OKX route integration', () => {
+  it('retires an errored Telegram monitor before attempting a saved-config reconnect', async () => {
+    const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-telegram-retry-'))
+    temporaryDirectories.push(userDataDirectory)
+    const controller = new AppController({
+      userDataDirectory,
+      version: 'test',
+      openExternal: async () => undefined
+    })
+    await controller.initialize()
+    const stop = vi.fn(async () => undefined)
+    const internals = controller as unknown as {
+      telegram?: {
+        readonly state: 'error'
+        readonly liveTradingReadiness: { ready: boolean; revision: number }
+        stop(): Promise<void>
+      }
+    }
+    internals.telegram = {
+      state: 'error',
+      liveTradingReadiness: { ready: false, revision: 7 },
+      stop
+    }
+
+    await expect(controller.connectTelegram()).rejects.toThrow('请先保存 Telegram API 凭据')
+
+    expect(stop).toHaveBeenCalledOnce()
+    expect(internals.telegram).toBeUndefined()
+    expect(controller.getSnapshot().safety.liveArmed).toBe(false)
+    await controller.dispose()
+  })
+
   it('refuses to replace OKX credentials while any order interlock is active, then allows it after safe terminal state', async () => {
     const userDataDirectory = await mkdtemp(path.join(tmpdir(), 'bwe-controller-credential-guard-'))
     temporaryDirectories.push(userDataDirectory)
@@ -752,12 +787,12 @@ describe('AppController OKX route integration', () => {
           authorizationToken?: SignalTradeAuthorizationToken
         ): Promise<SignalRecord | undefined>
       }
-      handleTelegramStatus(status: {
-        state: 'connected' | 'reconnecting'
+      handleTelegramStatus(source: unknown, status: {
+        state: 'connected' | 'reconnecting' | 'error'
         at: string
         detail?: string
       }): void
-      handleTelegramError(event: {
+      handleTelegramError(source: unknown, event: {
         at: string
         message: string
         code?: string
@@ -776,14 +811,18 @@ describe('AppController OKX route integration', () => {
         quotaExhausted: boolean
         lastError: string | null
       }): void
+      assertSignalTradeAuthorization(
+        expected: SignalTradeAuthorizationToken,
+        client: OkxV5Client
+      ): void
     }
-    installReadyTelegram(controller)
+    const telegram = installReadyTelegram(controller)
     internals.setConnection('telegram', 'connected', 'test')
     internals.setConnection('chatgpt', 'connected', 'test')
     await controller.startMonitoring()
     await controller.armLiveTrading('确认实盘')
 
-    await internals.handleTelegramError({
+    await internals.handleTelegramError(telegram, {
       at: new Date(now).toISOString(),
       message: 'test recoverable RPC warning',
       code: 'RPC_TRANSIENT',
@@ -795,21 +834,84 @@ describe('AppController OKX route integration', () => {
       safety: { liveArmed: true }
     })
 
-    internals.handleTelegramStatus({
+    const staleTelegram = {
+      liveTradingReadiness: { ready: false, revision: 99 }
+    }
+    await internals.handleTelegramError(staleTelegram, {
+      at: new Date(now).toISOString(),
+      message: 'stale fatal error',
+      recoverable: false,
+      cause: new Error('stale fatal error')
+    })
+    internals.handleTelegramStatus(staleTelegram, {
+      state: 'reconnecting',
+      at: new Date(now).toISOString(),
+      detail: 'stale reconnect'
+    })
+    expect(controller.getSnapshot()).toMatchObject({
+      connections: { telegram: { phase: 'connected' } },
+      safety: { liveArmed: true }
+    })
+
+    const preRecoveryAuthorization = captureSignalAuthorization(controller)
+    expect(preRecoveryAuthorization).toBeDefined()
+    telegram.liveTradingReadiness.ready = false
+    telegram.liveTradingReadiness.revision = 1
+    internals.handleTelegramStatus(telegram, {
       state: 'reconnecting',
       at: new Date(now).toISOString(),
       detail: 'test reconnect'
     })
     expect(controller.getSnapshot()).toMatchObject({
       connections: { telegram: { phase: 'connecting' } },
-      safety: { liveArmed: false }
+      safety: { monitoring: true, liveArmed: true }
     })
-    internals.handleTelegramStatus({
+    expect(runtimeArmed).toBe(true)
+    expect(captureSignalAuthorization(controller)).toBeUndefined()
+    expect(() => internals.assertSignalTradeAuthorization(
+      preRecoveryAuthorization!,
+      fakeClient
+    )).toThrow('Telegram 连接或 OKX 安全状态已变化')
+
+    telegram.liveTradingReadiness.ready = true
+    internals.handleTelegramStatus(telegram, {
       state: 'connected',
       at: new Date(now).toISOString(),
       detail: 'test restored'
     })
-    expect(controller.getSnapshot().safety.liveArmed).toBe(false)
+    expect(controller.getSnapshot()).toMatchObject({
+      connections: { telegram: { phase: 'connected' } },
+      safety: { monitoring: true, liveArmed: true }
+    })
+    const postRecoveryAuthorization = captureSignalAuthorization(controller)
+    expect(postRecoveryAuthorization).toBeDefined()
+    expect(postRecoveryAuthorization?.capability).toBe(preRecoveryAuthorization?.capability)
+    expect(postRecoveryAuthorization?.armRevision).toBe(preRecoveryAuthorization?.armRevision)
+    expect(postRecoveryAuthorization?.telegramRecoveryRevision).toBe(1)
+    expect(() => internals.assertSignalTradeAuthorization(
+      preRecoveryAuthorization!,
+      fakeClient
+    )).toThrow('Telegram 连接或 OKX 安全状态已变化')
+    expect(() => internals.assertSignalTradeAuthorization(
+      postRecoveryAuthorization!,
+      fakeClient
+    )).not.toThrow()
+
+    internals.handleTelegramStatus(telegram, {
+      state: 'error',
+      at: new Date(now).toISOString(),
+      detail: 'test fatal status'
+    })
+    expect(controller.getSnapshot()).toMatchObject({
+      connections: { telegram: { phase: 'error' } },
+      safety: { monitoring: true, liveArmed: false }
+    })
+    expect(runtimeArmed).toBe(false)
+    internals.handleTelegramStatus(telegram, {
+      state: 'connected',
+      at: new Date(now).toISOString(),
+      detail: 'test manually restored'
+    })
     await controller.armLiveTrading('确认实盘')
 
     internals.handleChatGptStatus({

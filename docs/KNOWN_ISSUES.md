@@ -2,7 +2,7 @@
 
 Only current limitations, reproducible environment problems, and active workarounds belong here. Resolved bugs are retained only in [`DECISIONS.md`](DECISIONS.md) when their lesson constrains future work.
 
-## Telegram low-latency recovery needs real-environment re-verification
+## Telegram low-latency and automatic reconnect need real-environment re-verification
 
 Symptoms: In a 2026-08-25 user test of the published `v0.1.7` Windows build, a target-channel post appeared in the signal timeline only after approximately two minutes.
 
@@ -12,7 +12,9 @@ Cause: The tagged implementation checked connection state and generic Telegram a
 
 Current mitigation in `v0.1.8`: The application performs a four-second-bounded target-channel cursor probe every five seconds. A missed post becomes an immediate no-token recovery preview, then enters the existing complete atomic catch-up and AI path as permanently non-trading. Target-channel, catch-up, authorization, forced-disconnect, and reconnect timeouts fail closed before diagnostics and cannot permanently occupy the health/recovery single-flight; obsolete stopped-client failures are isolated from a later monitor generation. Injected tests show preview and AI start inside the ten-second acceptance window, but do not prove real Telegram or ChatGPT latency.
 
-Next direction: Rebuild and repeat a user-supervised Telegram/ChatGPT-only test after these changes are made available. Measure channel publication, timeline `received`, and AI `analyzing` times without recording credentials, session data, message contents, or personal network details. Keep the issue open unless repeated posts begin analysis in roughly ten seconds or less.
+Additional mitigation in `v0.1.9`: A confirmed recoverable network outage keeps the existing manual arm only as suspended same-monitor intent. Failed reconnects are retried on later health cycles; readiness stays closed, old message tokens are invalidated, and catch-up messages remain permanently non-trading. The final `connected` event is emitted only after readiness is actually open, at which point later new live messages can use the retained arm. The final authorization check calls `updates.getState` directly so network/timeout failures remain recoverable; only an explicit teleproto `UnauthorizedError`/`AuthKeyError` is fatal, stops retry, and revokes the arm. Status/error/message callbacks are monitor-identity guarded so a stopped instance cannot lock or resume its replacement, and the saved-config connect action retires an errored/stopped instance before replacement. Injected tests cover two failed connects followed by success, both authorization-probe error classes, errored-monitor replacement, and controller token behavior, but no private Telegram/proxy interruption has been exercised.
+
+Next direction: After installing the reviewed `v0.1.9` package, repeat a user-supervised Telegram/ChatGPT-only test. Measure channel publication, timeline `received`, and AI `analyzing` times, then temporarily interrupt and restore the network while live ordering remains prohibited. Retain only aggregate timing/state behavior; never record credentials, session data, message contents, or personal network details. Keep the issue open until both low-latency receipt and repeated automatic reconnect are verified in the real environment.
 
 ## Dynamic ChatGPT quota refresh needs authenticated verification
 
@@ -23,6 +25,16 @@ Impact: Until a user-authorized real-account check is performed, the live Codex 
 Current workaround: The UI labels the value as updated every minute and retains the last trusted snapshot on a read failure. Treat it as usage guidance rather than a billing or authorization guarantee; the separate fail-closed exhausted state remains the trading authority.
 
 Next direction: Follow the dedicated P1 item in `TODO.md`, observe at least two poll cycles without relogin, and record only non-sensitive results.
+
+## Concurrent Telegram connect requests are not main-process single-flight
+
+Symptoms: Two non-UI callers that invoke `connectTelegram()` at nearly the same time can both pass the initial empty-monitor check while the encrypted credential read is pending, then construct competing monitor instances.
+
+Impact: The normal renderer serializes the connect action and monitor-identity guards prevent a stale instance from authorizing messages or mutating the active controller state, so this is not a live-order authorization bypass. A synthetic concurrent caller could still create redundant transport work until the losing instance settles.
+
+Current workaround: Use the existing renderer action, do not invoke duplicate connect IPC calls, and rely on the identity guards plus bounded stop when replacing an errored/stopped monitor.
+
+Next direction: Add a main-process Telegram connect single-flight or lifecycle reservation before the first credential-read await, with tests for concurrent connect, disconnect-during-connect, and late loser cleanup.
 
 ## Cross-client unknown may remain locked indefinitely
 
@@ -48,16 +60,6 @@ Current workaround: Only perform a user-authorized, dedicated-sub-account, minim
 
 Next direction: Follow the corresponding private-service P1 item in `TODO.md` and record only non-sensitive results.
 
-## Packaged tray menu and Explorer cleanup need user verification
-
-Symptoms: The `v0.1.8` isolated packaged portable build passed automated native checks for title-bar close-to-hide, process retention, second-instance restoration, and minimized-window restoration. The automated run did not operate the Explorer tray icon/context menu or observe stale-icon cleanup after the explicit tray quit action.
-
-Impact: The core packaged window lifecycle is verified, but tray icon visibility/activation, the explicit quit menu path, and orphan-icon cleanup still require the user's interactive Windows test. Native tray availability on macOS/Linux also remains unverified.
-
-Current workaround: Keep the main window visible for safety-critical supervision. If a usable tray cannot be created, the implementation deliberately leaves normal Windows/Linux close-to-exit behavior intact so the process cannot become hidden and unreachable.
-
-Next direction: In the published Windows `v0.1.8` package, verify tray icon activation, “显示主窗口”, explicit quit, process exit, and stale-icon cleanup as listed in `TODO.md`.
-
 ## Not suitable for unattended operation
 
 Symptoms: There is no automatic stop loss, take profit, maximum holding time, time-based close, autostart/headless supervision, or exit-time close. Emergency stop and application exit do not close an existing position. Hiding the window to the tray keeps the existing process and live state running; it does not add unattended-operation safeguards.
@@ -72,7 +74,7 @@ Next direction: Only design automated exit risk if the user explicitly expands s
 
 ## macOS and Linux are not release-verified
 
-Symptoms: Package scripts exist, but native packages, secure storage, proxy behavior, Codex platform binaries, UI, signing, and cold start have not been verified. The reviewed Electron runtime manifest currently has a Windows x64 profile only.
+Symptoms: Package scripts exist, but native packages, secure storage, proxy behavior, Codex platform binaries, UI, tray lifecycle/fallback, signing, and cold start have not been verified. The reviewed Electron runtime manifest currently has a Windows x64 profile only.
 
 Impact: A non-Windows dependency check/package may fail closed because no unique reviewed runtime profile exists, and the application must not be advertised as having verified three-platform binaries.
 
@@ -102,15 +104,17 @@ Current workaround: Re-arm manually only after all connections and safety blocke
 
 Next direction: Improve the notification without removing lifecycle revocation.
 
-## Windows artifacts are unsigned and use the default Electron icon
+## Windows artifacts are unsigned
 
 Symptoms: Windows reports the application and installer as `NotSigned`; SmartScreen may warn. The bundled OpenAI Codex executable may have a valid upstream signature, but that does not sign this application.
 
-Impact: Lower installation trust and less clear application identity.
+Current state: `v0.1.9` defines a custom BWE application icon, and Windows package inspection confirmed that the application EXE and NSIS installer both embed it. The historical `v0.1.8` assets remain immutable and retain the default Electron icon.
+
+Impact: The custom icon improves application identity, but the package still has lower installation trust until publisher signing is configured.
 
 Current workaround: Verify the release SHA-256 values in `CURRENT_STATE.md`/`SHA256SUMS.txt` and communicate the warning accurately.
 
-Next direction: Add project publisher signing and branding before treating distribution as polished.
+Next direction: Add project publisher signing before treating distribution as polished.
 
 ## Telegram and content support is intentionally narrow
 

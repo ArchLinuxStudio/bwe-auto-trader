@@ -98,8 +98,10 @@ The application, not teleproto, owns reconnect sequencing. Library auto-reconnec
 
 - A suspected connection failure immediately closes internal readiness, so no message can gain trade authority during validation.
 - While connected, a target-channel `getMessages(limit=1)` probe runs every five seconds with a four-second deadline. A generic authorization probe is not sufficient because it can succeed while a channel push is delayed. If the remote cursor is newer than the local cursor, the returned candidate is immediately buffered/observed without a token and the normal atomic recovery starts from the frozen local cursor.
-- A short failure can recover within one health interval without revoking the user's existing arm, but only after authorization is rechecked and all catch-up pages plus buffered live messages are merged atomically.
-- A sustained or repeated failure publishes `reconnecting`, revokes live authorization, and requires a new manual confirmation after recovery.
+- A recoverable failure retains only the already-created, process-local arm capability for the same monitor lifecycle. Readiness remains closed throughout recovery, so the retained arm is suspended and cannot authorize a message during the outage.
+- A sustained or repeated failure publishes `reconnecting` and continues one bounded, single-flight recovery attempt on each later health cycle until it succeeds or the user stops/disconnects. It does not mint or reconstruct an arm.
+- Recovery publishes `connected` only after the single-flight promise is cleared and authorization, complete catch-up, residual-buffer FIFO reservation, and monitor identity have all been verified. Only new live messages received after that point can use the retained arm. A fatal/authentication failure, explicit disconnect, stop, emergency stop, monitor replacement, settings lifecycle change, or application shutdown still revokes it and requires manual confirmation.
+- The final authorization probe calls the typed `updates.getState` RPC directly because teleproto's boolean `checkAuthorization()` intentionally collapses every RPC failure to `false`. Only an explicit `UnauthorizedError`/`AuthKeyError` is fatal; network, timeout, and unclassified RPC failures remain suspended and retry. An errored/stopped monitor is retired before a saved-config reconnect can install its replacement.
 - A timed-out target-channel, catch-up, authorization, disconnect, or connect operation cannot hold the single-flight health/recovery loop indefinitely. Readiness closes synchronously before asynchronous diagnostics. The next recovery tears down the sender even if its public `connected` flag is already false, so a late dial or pending request cannot accumulate behind a ghost connection.
 - A raw live message or bounded cursor-probe candidate already reserved in a recovery buffer can appear immediately as a display-only `received` record. The callback carries no authorization token, and AI waits until the atomic catch-up order is known.
 - Stopping monitoring, emergency stop, a fatal/rolled-back startup, or application shutdown terminally marks any still-pending display-only observation as `skipped`; a late canonical callback cannot restart it.
@@ -159,7 +161,7 @@ The renderer may briefly hold credentials or verification codes as form input be
 - AI returns analysis only and cannot construct exchange capability.
 - Live authorization is a process-local capability; it is neither persisted nor sent through IPC.
 - A message received while locked can never be authorized retroactively.
-- Lock, stop, reconnect/recovery, re-arm, monitor replacement, or lifecycle revision invalidates the old message token.
+- Lock, stop, every recovery revision, re-arm, monitor replacement, or lifecycle revision invalidates the old message token. A same-monitor network recovery may retain the arm capability, but never the token of a pre-recovery message.
 - Recovered messages never trade.
 - Recovery-time early observations carry no authorization and cannot start AI or consume canonical message state.
 - Abandoned recovery observations are consumed and terminally skipped rather than remaining pending or being revived later.

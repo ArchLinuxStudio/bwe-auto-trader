@@ -129,11 +129,13 @@ svg { display: block; width: 1em; height: 1em; }
   background: rgba(255, 255, 255, 0.025);
 }
 .mode-card.armed { border-color: rgba(255, 93, 114, 0.25); background: linear-gradient(145deg, var(--red-soft), rgba(255, 93, 114, 0.025)); }
+.mode-card.suspended { border-color: rgba(255, 189, 84, 0.3); background: linear-gradient(145deg, var(--amber-soft), rgba(255, 189, 84, 0.025)); }
 .mode-card-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
 .eyebrow, .mode-card .eyebrow { color: var(--muted); font-family: var(--font-mono); font-size: 9px; font-weight: 500; letter-spacing: 0.13em; text-transform: uppercase; }
 .pulse-dot { width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 0 4px currentColor; }
 .pulse-dot.safe { color: rgba(56, 232, 161, 0.14); background: var(--green); }
 .pulse-dot.danger { color: rgba(255, 93, 114, 0.14); background: var(--red); animation: pulse 1.8s infinite; }
+.pulse-dot.warning { color: rgba(255, 189, 84, 0.14); background: var(--amber); animation: pulse 1.8s infinite; }
 .mode-card strong { display: block; font-size: 13px; }
 .mode-card p { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .version-row { display: flex; justify-content: space-between; padding: 0 5px; color: #454e5e; font-family: var(--font-mono); font-size: 9px; }
