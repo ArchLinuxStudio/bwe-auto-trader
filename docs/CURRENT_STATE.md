@@ -4,20 +4,23 @@ Checkpoint date: 2026-08-27, Asia/Shanghai.
 
 ## Current Objective
 
-Package, commit, tag, and publish the accumulated custom application icon and fail-closed Telegram automatic-reconnect work as the Windows x64 `v0.1.9` release. The user explicitly authorized the code/documentation commit and Release in this task. Published `v0.1.8` assets remain immutable, and release verification must not access private Telegram, ChatGPT, or OKX services or place an order.
+The Windows x64 `v0.1.9` release is published with the custom application icon and fail-closed Telegram automatic reconnect. Preserve that release identity and continue only with the separately authorized real-environment checks or unfinished work in `docs/TODO.md`. Published `v0.1.8` and `v0.1.9` assets are immutable; future work must not access private Telegram, ChatGPT, or OKX services or place an order without fresh explicit authorization.
 
 ## Current Status
 
 - Version: `0.1.9`.
 - Branch: `main`.
-- Release target: `v0.1.9`; the reviewed local release candidate is complete and Git publication is the remaining step at this checkpoint.
-- Source baseline: published [`v0.1.8`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.8), commit `bf1449b5a4f55aeb27aa1dab4f4561408dc373da`. Local and remote `main` were aligned there before the authorized release work began.
-- The `v0.1.9` candidate adds `build/icon.svg` as the electron-builder application icon. The final application EXE, Portable ZIP application, and NSIS installer embed the same reviewed custom icon.
-- The candidate retains an existing manual arm only as suspended same-monitor intent across a recoverable Telegram network outage. It keeps retrying, restores readiness only after bounded connection/catch-up/authorization verification, and resumes authorization solely for later new live messages. Startup/recovery messages remain non-trading and pre-recovery tokens remain invalid.
+- Release: [`v0.1.9`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.9), published 2026-08-27 12:02:28 Asia/Shanghai.
+- Release commit: `36bdbbece160255cdb82537d173f8739afb8c37a`.
+- Annotated tag object: `765f0eb375f190b17de33e10cdb8f5beb86a0e93`; its peeled commit is the release commit above.
+- At publication, local `main`, remote-tracking `origin/main`, remote `refs/heads/main`, and the peeled `v0.1.9` tag were aligned at the release commit. The post-release documentation checkpoint is intentionally one commit after the release tag.
+- GitHub Release `377556649` contains exactly five reviewed assets. GitHub's remote SHA-256 digest and byte size for every asset match the local release facts below.
+- The release adds `build/icon.svg` as the electron-builder application icon. The application EXE, Portable ZIP application, and NSIS installer embed the same reviewed custom icon.
+- The release retains an existing manual arm only as suspended same-monitor intent across a recoverable Telegram network outage. It keeps retrying, restores readiness only after bounded connection/catch-up/authorization verification, and resumes authorization solely for later new live messages. Startup/recovery messages remain non-trading and pre-recovery tokens remain invalid.
 - Telegram status/error/message callbacks are bound to their owning monitor identity. A stopped monitor cannot overwrite, lock, or resume a replacement generation, and a successful recovery publishes `connected` only after `liveTradingReadiness.ready` is true. Recovery uses direct `updates.getState` error classification, so only explicit auth-key/session loss is fatal while auth-probe network failures continue retrying. Errored/stopped monitors are retired before saved-config reconnect.
 - Explicit `UnauthorizedError`/`AuthKeyError` is normalized to fatal authorization loss from any recovery stage, including connect and catch-up before the final authorization probe.
 - The renderer displays `实盘重连中` while the retained arm is suspended instead of claiming that signals can currently submit orders.
-- The final Windows package, artifact inspection, checksums, and isolated cold start pass. Commit, annotated tag, atomic push, GitHub asset upload, and remote verification remain pending.
+- The final Windows package, artifact inspection, checksums, isolated cold start, release commit, annotated tag, atomic push, five-asset upload, remote digest verification, and public publication pass.
 - Codex made no real Telegram, ChatGPT, or OKX private call and placed no real order during this release work.
 
 ## Completed
@@ -36,15 +39,16 @@ Package, commit, tag, and publish the accumulated custom application icon and fa
 - Added injected regressions for two failed reconnect attempts followed by success, a direct authorization-RPC network failure followed by retry, explicit `UnauthorizedError` becoming fatal without retry, readiness-backed `connected`, errored-monitor replacement, stale-monitor callback isolation, recovery-time authorization suspension, old-token rejection, and new post-recovery authorization.
 - Added a release-blocking regression for explicit authorization loss during catch-up, ensuring every recovery phase enters fatal state rather than retrying a revoked session indefinitely.
 - Bumped all application/runtime/NOTICE/manifest version identities to `0.1.9`, generated a clean Windows x64 NSIS and Portable package from the final source, and verified the exact five intended public assets.
+- Committed `36bdbbece160255cdb82537d173f8739afb8c37a` as `Release v0.1.9`, created annotated tag object `765f0eb375f190b17de33e10cdb8f5beb86a0e93`, atomically pushed source and tag, verified the draft's five remote assets, and published the final GitHub Release.
 
 ## In Progress
 
-The requested implementation and final local release candidate are complete. These release actions remain in progress:
+The requested implementation and release are complete. No source or release action remains in progress. These separately gated items remain open:
 
-1. Stage and review only the intended source, tests, icon, license metadata, and documentation; commit as `Release v0.1.9`.
-2. Create the annotated `v0.1.9` tag, atomically push `main` and the tag, create a draft GitHub Release with exactly five named assets, verify remote hashes/sizes/tag identity, and publish it.
-3. Record the final release/tag/asset state in this file and push the post-release documentation checkpoint.
-4. Real authenticated Telegram/ChatGPT and any OKX test remain separately gated by explicit private-service/order authorization.
+1. Real authenticated Telegram/ChatGPT latency, cursor recovery, and network-interruption behavior require explicit private-session authorization in a new task.
+2. Real authenticated ChatGPT quota behavior remains separately gated by explicit authorization.
+3. The first supervised minimal-fund OKX end-to-end test and later collection-only cross-client recovery work remain subject to the gates in `AGENTS.md`, `docs/DECISIONS.md`, and `docs/TODO.md`.
+4. The documented P2 main-process Telegram connect single-flight remains unfinished and is not a release safety bypass.
 
 ## Relevant Files
 
@@ -93,13 +97,13 @@ There is no known P0 blocker for the accepted approximately 10 USDT, actively su
 - Dynamic quota refresh is proven with an injected Codex app-server transport only; no authenticated account was observed across multiple live cycles.
 - No real dedicated-sub-account end-to-end order/close test has been authorized or performed.
 - A cross-client unknown can remain locked indefinitely. Automatic absence release remains intentionally disabled; repeated not-found or position-effect evidence is not sufficient.
-- The `v0.1.9` Windows candidate has the custom icon but remains unsigned, so SmartScreen may warn. macOS/Linux package/runtime-license profiles, cold starts, native icon conversion, and tray lifecycle/fallback behavior are not release-verified.
+- The published `v0.1.9` Windows artifacts have the custom icon but remain unsigned, so SmartScreen may warn. macOS/Linux package/runtime-license profiles, cold starts, native icon conversion, and tray lifecycle/fallback behavior are not release-verified.
 
 See `docs/KNOWN_ISSUES.md` for symptoms, exclusions, workarounds, and investigation directions. See `docs/TODO.md` for executable completion criteria.
 
 ## Verification State
 
-This task reran the Windows gates and built a clean final `v0.1.9` candidate after the last authorization-classification source change. No check made a private-service call. The Explorer tray/menu/quit result is retained as an explicitly identified `v0.1.8` lifecycle result because this release did not change tray behavior beyond a comment.
+This task reran the Windows gates and built the clean package published as `v0.1.9` after the last authorization-classification source change. No check made a private-service call. The Explorer tray/menu/quit result is retained as an explicitly identified `v0.1.8` lifecycle result because this release did not change tray behavior beyond a comment.
 
 | Verification | State |
 |---|---|
@@ -116,13 +120,13 @@ This task reran the Windows gates and built a clean final `v0.1.9` candidate aft
 | Focused Telegram/coordinator checks | Passed: missed-push preview at the first five-second tick, AI start inside the injected ten-second window, permanent non-trading recovery, bounded timeouts, FIFO, and generation isolation |
 | Focused tray lifecycle checks | Passed: 9/9 tests rerun in this Thread, plus the prior packaged close/hide, process-retention, second-launch, and minimized-restore checks |
 | Focused ChatGPT quota checks | Passed: 25 total tests, including cadence, timeout/retry, single-flight, logout, close isolation, and recovery without auto-arm |
-| Windows signatures | Confirmed limitation on the final `v0.1.9` candidate: Setup/application `NotSigned`; prior inspection found the bundled OpenAI Codex executable has a valid OpenAI signature |
+| Windows signatures | Confirmed limitation on published `v0.1.9`: Setup/application `NotSigned`; prior inspection found the bundled OpenAI Codex executable has a valid OpenAI signature |
 | Explorer tray menu/explicit quit cleanup | Previously passed via Windows UI Automation on build 26200 against the exact published `v0.1.8` Portable extraction; tray behavior is unchanged in `v0.1.9`, but this native UIA check was not rerun against the new package |
 | Real Telegram/ChatGPT/OKX private integration | Not verified |
 | Real order open/close | Not verified |
 | macOS/Linux package, cold start, and native tray lifecycle/fallback | Not verified |
 
-Final `v0.1.9` release-candidate asset facts:
+Published `v0.1.9` asset facts; GitHub remote digests and sizes match:
 
 | Asset | Size | SHA-256 |
 |---|---:|---|
@@ -134,22 +138,23 @@ Final `v0.1.9` release-candidate asset facts:
 
 ## Git Workspace State
 
-- `main`, `origin/main`, and the peeled `v0.1.8` tag were aligned at `bf1449b5a4f55aeb27aa1dab4f4561408dc373da` when release work began.
-- The current release candidate remains unstaged while the final diff is reviewed. It includes the icon, version/license metadata, reconnect/controller/renderer changes, tests, and authoritative documentation. `build/icon.svg` is the only untracked source asset and must be explicitly included.
-- Ignored final package and QA directories remain outside Git. The first pre-fix package was moved to the explicitly named ignored `release-v0.1.9-pre-fix-qa`; only the later clean `release-v0.1.9` assets may be uploaded. All QA application processes exited.
+- Release commit `36bdbbece160255cdb82537d173f8739afb8c37a` and annotated `v0.1.9` were atomically pushed before publication. This documentation-only checkpoint is intentionally the first commit after the release tag; Git remains authoritative for its own commit hash.
+- The working tree is expected to be clean after this final checkpoint is committed and pushed. No staged source work remains.
+- Ignored final package and QA directories remain outside Git. The first pre-fix package is retained only in the explicitly named ignored `release-v0.1.9-pre-fix-qa`; it was not uploaded. All QA application processes exited.
 - No unrelated tracked user change was altered, no `v0.1.8` tag or asset was changed, and the locally excluded historical `CODEX_CONTEXT.md` was not treated as authoritative context.
 
 ## Next Recommended Action
 
-1. Complete the authorized staged-diff review, commit `Release v0.1.9`, create an annotated tag, and atomically push `main` plus the tag without changing `v0.1.8`.
-2. Create a draft GitHub Release using exactly the five candidate assets above, verify tag identity, remote size/digest, checksums, and release notes, then publish it.
-3. Update this checkpoint with the final release commit/tag object/URL and remote verification, commit that documentation-only checkpoint, and push `main`.
-4. Only with separate explicit private-service authorization, perform the no-order Telegram/ChatGPT real-environment checks in `docs/TODO.md`; any real OKX order remains separately gated.
+1. Only with separate explicit private-service authorization, perform the no-order Telegram/ChatGPT real-environment checks in `docs/TODO.md`; any real OKX order remains separately gated.
+2. Add the P2 main-process `connectTelegram()` single-flight before expanding non-UI connect callers.
+3. Only with explicit ChatGPT authorization, observe authenticated remaining-quota updates across at least two 60-second cycles without relogin.
+4. On native macOS/Linux runners, complete the existing runtime-license, package, cold-start, icon, and tray checklist before claiming those platforms.
+5. Preserve recovered-message isolation, unknown-order non-retry, durable journal identity, and the final OKX transmission guard. Do not enable cross-client absence release without satisfying the accepted consistency decision.
 
 ## New Thread Bootstrap
 
 1. Read `AGENTS.md`, then `docs/INDEX.md`, then `docs/CURRENT_STATE.md`.
-2. Run `git status --short --branch`, inspect any staged/unstaged state, and continue only from the explicit `v0.1.9` release step recorded above.
-3. The final local candidate is Windows x64 only and has exactly five intended public assets. Never glob-upload either release directory; the `pre-fix-qa` package is rejected.
+2. Run `git status --short --branch`; expect `main`/`origin/main` to contain one documentation-only checkpoint after the peeled `v0.1.9` release commit.
+3. Treat published Windows x64 `v0.1.9` and its exactly five public assets as the immutable release baseline. The ignored `pre-fix-qa` package is rejected and must never be uploaded.
 4. The current injected baseline is 13 files/260 tests; focused reconnect/controller coverage is 67 tests. Dependency, typecheck, build, package, audit, artifact, icon, and isolated cold-start gates pass. Real Telegram reconnect remains unverified.
-5. The user explicitly authorized this `v0.1.9` code/documentation commit and Release. That does not authorize private-service access, real orders, unrelated changes, history rewriting, or modification of `v0.1.8`.
+5. The `v0.1.9` release authorization has been fulfilled. Future commits, pushes, releases, private-service access, or real orders require their own applicable authorization; never modify the `v0.1.8` or `v0.1.9` release assets.
