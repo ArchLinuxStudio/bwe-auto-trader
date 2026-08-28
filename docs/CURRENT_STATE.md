@@ -4,19 +4,19 @@ Checkpoint date: 2026-08-28, Asia/Shanghai.
 
 ## Current Objective
 
-Package, commit, tag, push, and publish the completed selective-system-notification and saved-configuration startup-restoration work as Windows x64 `v0.1.10`. The user explicitly authorized this code/documentation commit, push, and Release. Preserve the published `v0.1.8`/`v0.1.9` identities, every fail-closed trading invariant, and the rule that release verification must not access private Telegram, ChatGPT, or OKX services or place an order.
+Windows x64 `v0.1.10` is published with the completed selective-system-notification and saved-configuration startup-restoration work. Preserve the immutable `v0.1.8`/`v0.1.9`/`v0.1.10` identities, every fail-closed trading invariant, and the rule that future private Telegram, ChatGPT, or OKX verification requires separate explicit authorization.
 
 ## Current Status
 
-- Version: `0.1.10` release candidate.
+- Version: `0.1.10`, published Windows x64 release.
 - Branch: `main`.
-- The working tree contains the completed selective system notifications, saved-config startup restoration, release-identity bump, tests, and documentation for `v0.1.10`. All local release gates, Windows packaging, artifact review, and isolated no-config cold start pass; commit/tag/push and GitHub publication remain.
-- Published baseline: [`v0.1.9`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.9), published 2026-08-27 12:02:28 Asia/Shanghai.
-- Published `v0.1.9` baseline release commit: `36bdbbece160255cdb82537d173f8739afb8c37a`.
-- Published `v0.1.9` annotated tag object: `765f0eb375f190b17de33e10cdb8f5beb86a0e93`; its peeled commit is the baseline release commit above.
-- At `v0.1.9` publication, local `main`, remote-tracking `origin/main`, remote `refs/heads/main`, and the peeled tag were aligned at that release commit. Its post-release documentation checkpoint is intentionally one commit after the tag.
-- Published GitHub Release `377556649` is the immutable `v0.1.9` baseline and contains exactly five remotely verified assets. Its historical hashes are retained by Git/GitHub rather than duplicated in the current `v0.1.10` candidate table below.
-- Published `v0.1.9` introduced `build/icon.svg` as the electron-builder application icon. Read-only extraction from the `v0.1.10` unpacked application, final Portable ZIP application, and NSIS installer confirms all three still expose the same custom icon.
+- The selective system notifications, saved-config startup restoration, `0.1.10` identity, tests, release gates, Windows packaging, artifact review, isolated no-config cold start, commit/tag push, five-asset verification, and public GitHub publication are complete.
+- Published release: [`v0.1.10`](https://github.com/ArchLinuxStudio/bwe-auto-trader/releases/tag/v0.1.10), published 2026-08-28 19:12:54 Asia/Shanghai.
+- Release commit: `e542641b96f6df603ff4be0df48312b0243388e6`.
+- Annotated tag object: `eb42a5188d1e75c7d89c7f652008f4bcde55b2c3`; its peeled commit is the release commit above.
+- At publication, local `main`, remote-tracking `origin/main`, remote `refs/heads/main`, and peeled `v0.1.10` were aligned at the release commit. This post-release documentation checkpoint is intentionally the first commit after the tag.
+- GitHub Release `378431652` contains exactly the five reviewed assets in the verification table below. GitHub's remote SHA-256 digest and byte size for every asset match the local facts.
+- Read-only extraction from the unpacked application, final Portable ZIP application, and NSIS installer confirms all three expose the same custom `build/icon.svg`-derived icon.
 - The release retains an existing manual arm only as suspended same-monitor intent across a recoverable Telegram network outage. It keeps retrying, restores readiness only after bounded connection/catch-up/authorization verification, and resumes authorization solely for later new live messages. Startup/recovery messages remain non-trading and pre-recovery tokens remain invalid.
 - Telegram status/error/message callbacks are bound to their owning monitor identity. A stopped monitor cannot overwrite, lock, or resume a replacement generation, and a successful recovery publishes `connected` only after `liveTradingReadiness.ready` is true. Recovery uses direct `updates.getState` error classification, so only explicit auth-key/session loss is fatal while auth-probe network failures continue retrying. Errored/stopped monitors are retired before saved-config reconnect.
 - Explicit `UnauthorizedError`/`AuthKeyError` is normalized to fatal authorization loss from any recovery stage, including connect and catch-up before the final authorization probe.
@@ -31,6 +31,7 @@ Package, commit, tag, push, and publish the completed selective-system-notificat
 
 ## Completed
 
+- Committed `e542641b96f6df603ff4be0df48312b0243388e6` as `Release v0.1.10`, created annotated tag object `eb42a5188d1e75c7d89c7f652008f4bcde55b2c3`, atomically pushed source and tag, verified the draft's exact five remote assets and notes, and published GitHub Release `378431652` as the latest release.
 - Completed the post-version-bump `v0.1.10` release gates and Windows x64 packaging. The final NSIS/Portable artifacts passed dependency, typecheck, focused/full test, build, audit, afterPack, content/version/signature, checksum, ASAR parity, and fresh-user-data cold-start checks without accessing a private service or placing an order.
 - Implemented and locally verified saved-configuration startup restoration. Telegram, ChatGPT, and OKX attempts are isolated; monitoring starts only after all three initially configured services complete connection; startup and recovered messages remain non-trading; no path restores `liveArmed`; and user/shutdown lifecycle actions prevent late automatic monitoring.
 - Added main-process Telegram connection single-flight and late-owner cleanup across startup, renderer connect, disconnect, and shutdown. Added startup-specific ChatGPT account/warm-up validation without opening a login URL, manual-login takeover isolation, and unchanged fail-closed OKX connection/journal recovery reuse.
@@ -53,12 +54,7 @@ Package, commit, tag, push, and publish the completed selective-system-notificat
 
 ## In Progress
 
-The source implementation and local release-candidate verification are complete. The authorized `v0.1.10` publication workflow is now in progress:
-
-1. Commit the reviewed source and documentation as `Release v0.1.10`, create the annotated tag, and atomically push `main` plus the tag.
-2. Create a draft GitHub Release with exactly the five reviewed assets below, verify every remote byte size and SHA-256 digest, and only then publish it.
-3. Record final remote identities and release facts in this checkpoint and push a documentation-only checkpoint after the release tag.
-4. Real authenticated startup restoration, native toast/click observation, and any real order remain separately gated; none is part of this release task.
+No `v0.1.10` release work remains. The release commit, annotated tag, five public assets, and GitHub Release are immutable. Real authenticated startup restoration, native toast/click observation, and any real order remain separate unfinished work with their own authorization and safety gates in `docs/TODO.md`.
 
 ## Relevant Files
 
@@ -113,14 +109,14 @@ There is no known P0 blocker for the accepted approximately 10 USDT, actively su
 - Dynamic quota refresh is proven with an injected Codex app-server transport only; no authenticated account was observed across multiple live cycles.
 - No real dedicated-sub-account end-to-end order/close test has been authorized or performed.
 - A cross-client unknown can remain locked indefinitely. Automatic absence release remains intentionally disabled; repeated not-found or position-effect evidence is not sufficient.
-- The `v0.1.10` Windows release candidate has the custom icon but remains unsigned, so SmartScreen may warn. macOS/Linux package/runtime-license profiles, cold starts, native icon conversion, and tray lifecycle/fallback behavior are not release-verified.
+- The published `v0.1.10` Windows artifacts have the custom icon but remain unsigned, so SmartScreen may warn. macOS/Linux package/runtime-license profiles, cold starts, native icon conversion, and tray lifecycle/fallback behavior are not release-verified.
 - Selective system notification routing is verified with injected callbacks only. Native visibility and click-to-restore behavior have not been observed in an installed NSIS build or the Portable ZIP; Windows notification settings or focus modes may suppress them.
 
 See `docs/KNOWN_ISSUES.md` for symptoms, exclusions, workarounds, and investigation directions. See `docs/TODO.md` for executable completion criteria.
 
 ## Verification State
 
-The combined selective-notification and startup-restoration behavior passed the complete repository gates after the `0.1.10` identity bump. The reviewed Windows x64 release candidate also passed packaging, artifact inspection, and a no-config isolated cold start. All service tests use mocks or injected transports; no check accessed a private service or placed an order. Published `v0.1.9` package and release facts remain immutable.
+The combined selective-notification and startup-restoration behavior passed the complete repository gates after the `0.1.10` identity bump. The published Windows x64 artifacts also passed packaging, artifact inspection, and a no-config isolated cold start before publication. All service tests use mocks or injected transports; no check accessed a private service or placed an order. Published `v0.1.9` package and release facts remain immutable.
 
 | Verification | State |
 |---|---|
@@ -141,14 +137,14 @@ The combined selective-notification and startup-restoration behavior passed the 
 | Focused tray lifecycle checks | Passed: 9/9 tests rerun in this Thread, plus the prior packaged close/hide, process-retention, second-launch, and minimized-restore checks |
 | Focused ChatGPT quota checks | Passed: 25 total tests, including cadence, timeout/retry, single-flight, logout, close isolation, and recovery without auto-arm |
 | Focused system-notification checks | Passed: 4 files, 63 tests; covers received/analyzing/submitting selection, recovered receipt deduplication, neutral text, reconnect episode deduplication, setting suppression, ordinary-notice isolation, obsolete-monitor isolation, and sync/async delivery-failure isolation |
-| Native Windows toast/click smoke | Not verified: the candidate was cold-started, but no synthetic lifecycle event was injected and no toast visibility or notification click was observed |
-| Windows signatures | Confirmed limitation on candidate `v0.1.10`: Setup/application `NotSigned`; the bundled OpenAI Codex executable has a valid upstream signature |
-| Explorer tray menu/explicit quit cleanup | Previously passed via Windows UI Automation on build 26200 against the exact published `v0.1.8` Portable extraction; tray behavior is unchanged, but this native UIA check was not rerun against the `v0.1.10` candidate |
+| Native Windows toast/click smoke | Not verified: the published package was cold-started, but no synthetic lifecycle event was injected and no toast visibility or notification click was observed |
+| Windows signatures | Confirmed limitation on published `v0.1.10`: Setup/application `NotSigned`; the bundled OpenAI Codex executable has a valid upstream signature |
+| Explorer tray menu/explicit quit cleanup | Previously passed via Windows UI Automation on build 26200 against the exact published `v0.1.8` Portable extraction; tray behavior is unchanged, but this native UIA check was not rerun against published `v0.1.10` |
 | Real Telegram/ChatGPT/OKX private integration | Not verified |
 | Real order open/close | Not verified |
 | macOS/Linux package, cold start, and native tray lifecycle/fallback | Not verified |
 
-Final local `v0.1.10` release-candidate asset facts; remote digests and sizes still require draft-Release verification:
+Published `v0.1.10` asset facts; GitHub remote digests and sizes match:
 
 | Asset | Size | SHA-256 |
 |---|---:|---|
@@ -160,22 +156,21 @@ Final local `v0.1.10` release-candidate asset facts; remote digests and sizes st
 
 ## Git Workspace State
 
-- Published release commit `36bdbbece160255cdb82537d173f8739afb8c37a` and annotated `v0.1.9` remain unchanged. Git remains authoritative for their identities.
-- `main` is aligned with `origin/main` at `83d8897` before the new release commit. The working tree intentionally contains the notification, startup-restoration, `0.1.10` identity, test, and documentation changes plus the two new controller test files. Nothing is staged yet; the user explicitly authorized the `v0.1.10` commit, push, tag, and Release.
-- Ignored `release-v0.1.10` contains the reviewed final candidate. The empty/incomplete first network-failed packaging directory and isolated inspection/cold-start directories remain ignored and will not be uploaded. All package QA processes exited.
-- No unrelated tracked user change was altered, no `v0.1.8` or `v0.1.9` tag/asset was changed, and the locally excluded historical `CODEX_CONTEXT.md` was not treated as authoritative context.
+- Release commit `e542641b96f6df603ff4be0df48312b0243388e6` and annotated `v0.1.10` were atomically pushed before publication. This documentation-only checkpoint is intentionally the first commit after the release tag; Git remains authoritative for the checkpoint's own commit hash.
+- After this checkpoint push, local `main`, remote-tracking `origin/main`, and remote `refs/heads/main` are aligned; peeled `v0.1.10` intentionally remains one commit behind at the immutable release source.
+- Ignored `release-v0.1.10` contains the reviewed final release assets. The empty/incomplete first network-failed packaging directory and isolated inspection/cold-start directories remain ignored and were not uploaded. All package QA processes exited.
+- No unrelated tracked user change was altered, no prior release tag/asset was changed, no `v0.1.10` asset was changed after remote verification, and the locally excluded historical `CODEX_CONTEXT.md` was not treated as authoritative context.
 
 ## Next Recommended Action
 
-1. Commit `Release v0.1.10`, create an annotated tag, and atomically push `main` plus the tag.
-2. Upload exactly the reviewed five assets to a draft Release, verify all remote digests and sizes, then publish.
-3. Record the final release identities and remote asset facts in this checkpoint and push the documentation-only checkpoint.
-4. Preserve recovered-message isolation, unknown-order non-retry, durable journal identity, and the final OKX transmission guard. Startup connection and monitoring must never reconstruct live authorization.
+1. Keep the published `v0.1.10` tag and its five assets immutable; do not overwrite or append files to that release.
+2. Select the next explicit requirement from `docs/TODO.md` or a new user request. Private-service and real-order checks still require separate current-task authorization.
+3. Preserve recovered-message isolation, unknown-order non-retry, durable journal identity, and the final OKX transmission guard. Startup connection and monitoring must never reconstruct live authorization.
 
 ## New Thread Bootstrap
 
 1. Read `AGENTS.md`, then `docs/INDEX.md`, then `docs/CURRENT_STATE.md`.
-2. Run `git status --short --branch`; inspect staged/unstaged state and continue from the current `v0.1.10` release step above.
-3. Treat published Windows x64 `v0.1.9` and its exactly five public assets as immutable. Never overwrite or append assets to that release.
-4. The post-version-bump `v0.1.10` candidate passed dependency, typecheck, 6-file/114-test focused, 15-file/281-test full, build, audit, packaging, artifact, and isolated cold-start checks. Continue from the commit/tag step; do not rerun private-service checks.
-5. The user explicitly authorized the `v0.1.10` code/documentation commit, push, annotated tag, and GitHub Release. This does not authorize private-service access, real orders, unrelated changes, history rewriting, or modification of older releases.
+2. Run `git status --short --branch`; inspect staged/unstaged state before starting the next task.
+3. Treat published Windows x64 `v0.1.8`, `v0.1.9`, and `v0.1.10` plus their public assets as immutable. Never overwrite or append assets to those releases.
+4. `v0.1.10` passed dependency, typecheck, 6-file/114-test focused, 15-file/281-test full, build, audit, packaging, artifact, exact-Portable cold-start, remote-asset, and public-release checks. Do not repeat private-service checks without new authorization.
+5. The prior authorization for the `v0.1.10` commit, push, annotated tag, and GitHub Release is fulfilled. It does not carry forward to private-service access, real orders, unrelated changes, history rewriting, or modification of published releases.

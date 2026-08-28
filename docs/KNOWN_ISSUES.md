@@ -98,7 +98,7 @@ Next direction: Improve the notification without removing lifecycle revocation.
 
 Symptoms: Windows reports the application and installer as `NotSigned`; SmartScreen may warn. The bundled OpenAI Codex executable may have a valid upstream signature, but that does not sign this application.
 
-Current state: `v0.1.9` and the reviewed `v0.1.10` Windows artifacts use the custom BWE application icon. The `v0.1.10` application EXE and NSIS installer remain `NotSigned`. The historical `v0.1.8` assets remain immutable and retain the default Electron icon.
+Current state: `v0.1.9` and the published `v0.1.10` Windows artifacts use the custom BWE application icon. The `v0.1.10` application EXE and NSIS installer remain `NotSigned`. The historical `v0.1.8` assets remain immutable and retain the default Electron icon.
 
 Impact: The custom icon improves application identity, but the package still has lower installation trust until publisher signing is configured.
 
