@@ -93,6 +93,10 @@ export interface SignalCoordinatorDependencies {
     title: string
     detail: string
   }): void | Promise<void>
+  onSystemNotice?(input: {
+    title: string
+    detail: string
+  }): void | Promise<void>
   onAudit?(event: string, data: Record<string, unknown>): void | Promise<void>
   onTradeError?(error: unknown): TradeErrorDisposition | Promise<TradeErrorDisposition>
   now?: () => number
@@ -209,6 +213,10 @@ export class SignalCoordinator {
       updatedAt: createdAt
     }
     await this.publish(record)
+    this.systemNotice(
+      '收到频道消息',
+      '已收到一条频道消息，请在程序内查看详情'
+    )
     return record
   }
 
@@ -317,6 +325,10 @@ export class SignalCoordinator {
         updatedAt: createdAt
       }
       await this.publish(record)
+      this.systemNotice(
+        '收到频道消息',
+        '已收到一条频道消息，请在程序内查看详情'
+      )
     }
 
     // Telegram may replay channel history after a reconnect and assign a fresh
@@ -333,6 +345,10 @@ export class SignalCoordinator {
       return record
     }
     record = await this.update(record, 'analyzing', 'ChatGPT 正在快速判断币种和方向')
+    this.systemNotice(
+      'AI 开始分析频道消息',
+      '正在分析最新收到的频道消息，请在程序内查看进度'
+    )
 
     const settings = this.dependencies.settings()
     let result: TradingSignalAnalysis
@@ -506,6 +522,10 @@ export class SignalCoordinator {
       }).catch(() => undefined)
       return structuredClone(record)
     }
+    this.systemNotice(
+      '正在进行下单操作',
+      '已进入订单提交流程，请在程序内查看状态'
+    )
     // Keep the exchange mutation in its own transaction boundary. Once this
     // resolves, failures in local rendering, notifications, or audit storage
     // must never rewrite an accepted order as "failed" or release its slot.
@@ -969,6 +989,16 @@ export class SignalCoordinator {
     detail: string
   ): Promise<void> {
     await this.dependencies.onNotice?.({ level, title, detail })
+  }
+
+  private systemNotice(title: string, detail: string): void {
+    try {
+      void Promise.resolve(
+        this.dependencies.onSystemNotice?.({ title, detail })
+      ).catch(() => undefined)
+    } catch {
+      // OS notifications are display-only and must never alter signal processing.
+    }
   }
 
   private async audit(event: string, data: Record<string, unknown>): Promise<void> {

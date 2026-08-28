@@ -78,7 +78,8 @@ function mergeSettings(value: Partial<PublicSettings>): PublicSettings {
     ...value,
     proxy: { ...DEFAULT_SETTINGS.proxy, ...(value.proxy ?? {}) },
     trading: { ...DEFAULT_SETTINGS.trading, ...(value.trading ?? {}) },
-    // Never trust a persisted ChatGPT flag; auth state comes from App Server.
-    chatgptConfigured: false
+    // This flag is only a startup hint. App Server account/read remains the
+    // authority for whether a saved ChatGPT session is actually authenticated.
+    chatgptConfigured: value.chatgptConfigured === true
   }
 }

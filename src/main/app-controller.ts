@@ -33,6 +33,7 @@ import { AuditLog } from './services/audit-log'
 import {
   ChatGptService,
   type ChatGptRateLimits,
+  type ChatGptServiceOptions,
   type TradingSignalAnalysis
 } from './services/chatgpt'
 import { runNetworkDiagnostics } from './services/network-diagnostics'
@@ -73,6 +74,7 @@ import {
   type TelegramAuthField,
   type TelegramAuthRequest,
   type TelegramMonitorError,
+  type TelegramMonitorOptions,
   type TelegramStatusEvent
 } from './services/telegram'
 import { toTelegramMessagePayload } from './services/telegram-message'
@@ -85,9 +87,11 @@ export interface AppControllerOptions {
   userDataDirectory: string
   version: string
   openExternal(url: string): Promise<void>
-  showDesktopNotification?(title: string, body: string): void
+  showDesktopNotification?(title: string, body: string): void | Promise<void>
   now?: () => number
   createOkxClient?(options: OkxClientOptions): OkxV5Client
+  createTelegramMonitor?(options: TelegramMonitorOptions): TelegramMonitor
+  createChatGptService?(options: ChatGptServiceOptions): ChatGptService
   analyzeSignal?(message: string, timeoutMs: number): Promise<TradingSignalAnalysis>
 }
 
@@ -157,6 +161,8 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private readonly coordinator: SignalCoordinator
   private settings!: PublicSettings
   private telegram?: TelegramMonitor
+  private telegramConnectTask?: Promise<void>
+  private telegramConnectTaskIsStartup = false
   private chatgpt?: ChatGptService
   private unsubscribeChatGptStatus?: () => void
   private okx?: OkxV5Client
@@ -197,6 +203,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private telegramLifecycleRevision = 0
   private liveArmCapability?: object
   private telegramReconnectRetainedArm = false
+  private telegramReconnectSystemNotified = false
   private emergencyStopped = false
   private armedAt?: number
   private aiModel?: string
@@ -205,6 +212,9 @@ export class AppController extends EventEmitter<ControllerEvents> {
   private lastError?: string
   private initialized = false
   private closing = false
+  private startupConnectionTask?: Promise<void>
+  private startupOkxConnectionTask?: Promise<void>
+  private startupMonitoringAllowed = false
   private positionRefresh?: Promise<void>
   private activePositionClose?: Promise<void>
   private closeScopedArmedClient?: OkxV5Client
@@ -313,6 +323,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
       },
       onRecord: () => this.emitSnapshot(),
       onNotice: (notice) => this.notify(notice.level, notice.title, notice.detail),
+      onSystemNotice: (notice) => this.showSystemNotification(notice.title, notice.detail),
       onAudit: (event, data) => this.audit.write(event, 'info', data),
       onTradeError: async (error) => {
         // Disarming mutates the capability before its audit/notification
@@ -386,7 +397,13 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.settings.okxConfigured ? '已配置，未连接' : '未配置',
       this.now()
     )
-    this.connections.chatgpt = connection('disconnected', '等待 ChatGPT Plus 登录', this.now())
+    this.connections.chatgpt = connection(
+      'disconnected',
+      this.settings.chatgptConfigured
+        ? '已保存登录，等待自动恢复'
+        : '等待 ChatGPT Plus 登录',
+      this.now()
+    )
     this.initialized = true
     await this.audit.write('application_started', 'info', {
       version: this.options.version,
@@ -397,6 +414,114 @@ export class AppController extends EventEmitter<ControllerEvents> {
       mutationJournalHealthy: !this.mutationJournalFailure
     })
     this.emitSnapshot()
+  }
+
+  restoreConfiguredServices(): Promise<void> {
+    this.assertInitialized()
+    if (this.startupConnectionTask) return this.startupConnectionTask
+
+    const task = Promise.resolve().then(() => this.restoreConfiguredServicesOnce())
+    this.startupConnectionTask = task
+    return task
+  }
+
+  private async restoreConfiguredServicesOnce(): Promise<void> {
+    if (this.closing) return
+    const configured = {
+      telegram: this.settings.telegramConfigured,
+      chatgpt: this.settings.chatgptConfigured,
+      okx: this.settings.okxConfigured
+    }
+    const allConfigured = configured.telegram && configured.chatgpt && configured.okx
+    this.startupMonitoringAllowed = allConfigured
+    const attempts: Promise<void>[] = []
+    if (configured.telegram) {
+      attempts.push(this.tryStartupConnection(
+        'telegram',
+        'Telegram',
+        () => this.ensureTelegramConnectTask(true)
+      ))
+    }
+    if (configured.chatgpt) {
+      attempts.push(this.tryStartupConnection(
+        'chatgpt',
+        'ChatGPT',
+        () => this.restoreExistingChatGptSession()
+      ))
+    }
+    if (configured.okx) {
+      const task = this.tryStartupConnection('okx', 'OKX', () => this.connectOkxWithLifecycle())
+      this.startupOkxConnectionTask = task
+      const clear = (): void => {
+        if (this.startupOkxConnectionTask === task) this.startupOkxConnectionTask = undefined
+      }
+      void task.then(clear, clear)
+      attempts.push(task)
+    }
+
+    await Promise.all(attempts)
+    if (this.closing) return
+
+    const allConnected = (
+      this.connections.telegram.phase === 'connected' &&
+      this.connections.chatgpt.phase === 'connected' &&
+      this.connections.okx.phase === 'connected'
+    )
+    let monitoringStarted = false
+    if (this.startupMonitoringAllowed && allConnected) {
+      try {
+        await this.startMonitoring()
+        monitoringStarted = this.monitoring
+      } catch {
+        await this.audit.write('startup_monitoring_failed', 'warning').catch(() => undefined)
+        await this.notify(
+          'warning',
+          '自动监听未开启',
+          '三项服务已连接，但监听启动未完成；请在程序内手动重试'
+        ).catch(() => undefined)
+      }
+    }
+    this.startupMonitoringAllowed = false
+
+    await this.audit.write('startup_connections_completed', 'info', {
+      configuredServices: Object.entries(configured)
+        .filter(([, isConfigured]) => isConfigured)
+        .map(([service]) => service),
+      connectedServices: Object.entries(this.connections)
+        .filter(([, status]) => status.phase === 'connected')
+        .map(([service]) => service),
+      monitoringStarted,
+      liveArmed: this.liveArmed
+    }).catch(() => undefined)
+  }
+
+  private async tryStartupConnection(
+    key: keyof AppSnapshot['connections'],
+    label: string,
+    operation: () => Promise<void>
+  ): Promise<void> {
+    try {
+      await operation()
+      if (!this.closing && this.connections[key].phase !== 'connected') {
+        await this.audit.write('startup_connection_not_restored', 'warning', {
+          service: key,
+          phase: this.connections[key].phase
+        }).catch(() => undefined)
+      }
+    } catch {
+      if (this.closing) return
+      if (this.connections[key].phase !== 'error') {
+        this.setConnection(key, 'error', '自动连接未完成，请检查已保存配置后重试')
+      }
+      await this.audit.write('startup_connection_failed', 'warning', {
+        service: key
+      }).catch(() => undefined)
+      await this.notify(
+        'warning',
+        `${label} 自动连接未完成`,
+        '请在程序内检查已保存配置并手动重试'
+      ).catch(() => undefined)
+    }
   }
 
   getSnapshot(): AppSnapshot {
@@ -450,14 +575,48 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async connectTelegram(): Promise<void> {
-    // Authentication can require a second IPC call for OTP/2FA. Do not keep
-    // the initial connect IPC pending or the renderer would be unable to submit
-    // that prompt while its connect action is busy.
+    this.startupMonitoringAllowed = false
+    // Authentication can require a second IPC call for OTP/2FA. The full task
+    // is main-process single-flight, while the interactive IPC call returns
+    // after a short grace period so the renderer can submit that prompt.
+    const task = this.ensureTelegramConnectTask()
+    await Promise.race([
+      task,
+      new Promise<void>((resolve) => setTimeout(resolve, 400))
+    ])
+  }
+
+  private ensureTelegramConnectTask(startedAtStartup = false): Promise<void> {
+    if (this.closing) return Promise.reject(new Error('应用正在退出，不能连接 Telegram'))
+    if (this.telegramConnectTask) {
+      if (startedAtStartup) this.telegramConnectTaskIsStartup = true
+      return this.telegramConnectTask
+    }
+    const existingMonitor = this.telegram
+    if (existingMonitor && existingMonitor.state !== 'error' && existingMonitor.state !== 'stopped') {
+      return Promise.resolve()
+    }
+
+    const lifecycleRevision = this.telegramLifecycleRevision + 1
+    this.telegramLifecycleRevision = lifecycleRevision
+    this.telegramConnectTaskIsStartup = startedAtStartup
+    const task = this.connectTelegramFully(lifecycleRevision)
+    this.telegramConnectTask = task
+    const clear = (): void => {
+      if (this.telegramConnectTask === task) {
+        this.telegramConnectTask = undefined
+        this.telegramConnectTaskIsStartup = false
+      }
+    }
+    void task.then(clear, clear)
+    return task
+  }
+
+  private async connectTelegramFully(lifecycleRevision: number): Promise<void> {
     const existingMonitor = this.telegram
     if (existingMonitor) {
       if (existingMonitor.state !== 'error' && existingMonitor.state !== 'stopped') return
       this.telegram = undefined
-      this.telegramLifecycleRevision += 1
       const disarm = this.disarmLiveTrading(
         'Telegram 错误连接正在重建，已保持锁定；恢复后需人工重新确认实盘'
       ).catch(() => undefined)
@@ -466,18 +625,17 @@ export class AppController extends EventEmitter<ControllerEvents> {
       ).catch(() => undefined)
       await existingMonitor.stop().catch(() => undefined)
       await disarm
-      // Another connect request may have installed a replacement while the
-      // obsolete monitor performed its bounded stop.
-      if (this.telegram) return
+      if (!this.ownsTelegramConnect(lifecycleRevision)) return
     }
     const apiId = this.settings.telegramApiId
     const stored = await this.readJsonSecret<{ apiHash: string; phoneNumber: string }>(
       TELEGRAM_CREDENTIALS_KEY
     )
+    if (!this.ownsTelegramConnect(lifecycleRevision)) return
     if (!apiId || !stored?.apiHash || !stored.phoneNumber) throw new Error('请先保存 Telegram API 凭据')
     this.setConnection('telegram', 'connecting', `正在通过 Clash 连接 @${this.settings.trading.channelUsername}`)
     let monitor!: TelegramMonitor
-    monitor = new TelegramMonitor({
+    const monitorOptions: TelegramMonitorOptions = {
       apiId,
       apiHash: stored.apiHash,
       channel: normalizeChannelUsername(this.settings.trading.channelUsername),
@@ -487,7 +645,11 @@ export class AppController extends EventEmitter<ControllerEvents> {
       auth: { phoneNumber: stored.phoneNumber },
       captureAuthorization: () => this.currentSignalTradeAuthorization(),
       callbacks: {
-        onStatus: (status) => this.handleTelegramStatus(monitor, status),
+        onStatus: (status) => this.handleTelegramStatus(
+          monitor,
+          status,
+          this.isStartupTelegramConnect(lifecycleRevision)
+        ),
         onAuthRequired: (request) => {
           if (this.telegram === monitor) this.createTelegramPrompt(request)
         },
@@ -502,32 +664,55 @@ export class AppController extends EventEmitter<ControllerEvents> {
             context.authorizationToken
           )
         },
-        onError: (event) => this.handleTelegramError(monitor, event)
+        onError: (event) => this.handleTelegramError(
+          monitor,
+          event,
+          this.isStartupTelegramConnect(lifecycleRevision)
+        )
       }
-    })
+    }
+    monitor = this.options.createTelegramMonitor?.(monitorOptions) ?? new TelegramMonitor(monitorOptions)
+    if (!this.ownsTelegramConnect(lifecycleRevision)) {
+      await monitor.stop().catch(() => undefined)
+      return
+    }
+    this.telegramReconnectSystemNotified = false
     this.telegram = monitor
-    this.telegramLifecycleRevision += 1
-    // start() reaches the auth broker before waiting for OTP/2FA, so wait a
-    // short moment to surface immediate configuration/proxy failures while
-    // still returning control to the renderer for interactive auth prompts.
-    const start = this.finishTelegramConnection(monitor)
-    await Promise.race([
-      start,
-      new Promise<void>((resolve) => setTimeout(resolve, 400))
-    ])
+    await this.finishTelegramConnection(monitor, lifecycleRevision)
   }
 
-  private async finishTelegramConnection(monitor: TelegramMonitor): Promise<void> {
+  private ownsTelegramConnect(lifecycleRevision: number): boolean {
+    return !this.closing && this.telegramLifecycleRevision === lifecycleRevision
+  }
+
+  private isStartupTelegramConnect(lifecycleRevision: number): boolean {
+    return this.ownsTelegramConnect(lifecycleRevision) && this.telegramConnectTaskIsStartup
+  }
+
+  private async finishTelegramConnection(
+    monitor: TelegramMonitor,
+    lifecycleRevision: number
+  ): Promise<void> {
     try {
       await monitor.start()
-      if (this.telegram !== monitor) return
+      if (!this.ownsTelegramConnect(lifecycleRevision) || this.telegram !== monitor) {
+        await monitor.stop().catch(() => undefined)
+        return
+      }
       this.pendingPrompt = undefined
       this.setConnection('telegram', 'connected', `已连接并守候 @${monitor.channelUsername}`)
       await this.audit.write('telegram_connected', 'info', { channel: monitor.channelUsername })
     } catch (error) {
-      if (this.telegram !== monitor) return
+      if (!this.ownsTelegramConnect(lifecycleRevision) || this.telegram !== monitor) {
+        await monitor.stop().catch(() => undefined)
+        return
+      }
+      const detail = this.isStartupTelegramConnect(lifecycleRevision)
+        ? 'Telegram 自动连接未完成，请检查已保存配置、网络与代理后重试'
+        : errorText(error)
       const disarm = this.disarmLiveTrading('Telegram 连接失败，已锁定实盘').catch(() => undefined)
       this.telegram = undefined
+      this.telegramReconnectSystemNotified = false
       this.telegramLifecycleRevision += 1
       const failedLifecycleRevision = this.telegramLifecycleRevision
       await this.coordinator.finalizePendingRecoveryObservations(
@@ -535,16 +720,20 @@ export class AppController extends EventEmitter<ControllerEvents> {
       ).catch(() => undefined)
       await disarm
       if (this.telegram || this.telegramLifecycleRevision !== failedLifecycleRevision) return
-      this.setConnection('telegram', 'error', errorText(error))
-      await this.notify('error', 'Telegram 连接失败', errorText(error))
+      this.setConnection('telegram', 'error', detail)
+      await this.notify('error', 'Telegram 连接失败', detail)
     }
   }
 
   async disconnectTelegram(): Promise<void> {
+    this.startupMonitoringAllowed = false
     this.pendingPrompt = undefined
+    this.telegramReconnectSystemNotified = false
+    this.telegramConnectTask = undefined
+    this.telegramConnectTaskIsStartup = false
+    this.telegramLifecycleRevision += 1
     const monitor = this.telegram
     this.telegram = undefined
-    if (monitor) this.telegramLifecycleRevision += 1
     const disconnectedLifecycleRevision = this.telegramLifecycleRevision
     // stopMonitoring flips monitoring/liveArmed synchronously before its first
     // await, so any already-running AI callback is fail-closed while the
@@ -580,33 +769,48 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async loginChatGpt(): Promise<{ authUrl?: string; userCode?: string }> {
+    this.startupMonitoringAllowed = false
+    if (this.closing) throw new Error('应用正在退出，不能连接 ChatGPT')
     if (this.chatgpt?.getStatus().authenticated) return {}
     await this.closeChatGptService()
+    if (this.closing) throw new Error('应用正在退出，不能连接 ChatGPT')
     this.setConnection('chatgpt', 'connecting', '正在启动本机 ChatGPT 登录服务')
-    const proxyUrl = proxyUrlForChild(this.settings.proxy)
-    const service = new ChatGptService({
-      proxyUrl,
-      timeoutMs: this.settings.trading.aiTimeoutMs,
-      cwd: path.resolve(this.options.userDataDirectory, '..')
-    })
+    const service = this.createChatGptService()
     this.chatgpt = service
     this.unsubscribeChatGptStatus = service.onStatus((status) => this.handleChatGptStatus(status))
     try {
       await service.start()
+      if (this.closing || this.chatgpt !== service) {
+        await service.close().catch(() => undefined)
+        throw new Error('应用正在退出，ChatGPT 登录已取消')
+      }
       if (service.getStatus().authenticated) {
         await service.listModels()
         await service.warmUp()
+        if (this.closing || this.chatgpt !== service) {
+          await service.close().catch(() => undefined)
+          throw new Error('应用正在退出，ChatGPT 登录已取消')
+        }
         this.settings = await this.settingsStore.setFlags({ chatgptConfigured: true })
         this.handleChatGptStatus(service.getStatus())
         return {}
       }
       try {
         const login = await service.startBrowserLogin()
+        if (this.closing || this.chatgpt !== service) {
+          await service.close().catch(() => undefined)
+          throw new Error('应用正在退出，ChatGPT 登录已取消')
+        }
         await this.options.openExternal(login.authUrl)
         void this.finishChatGptLogin(service, login.loginId)
         return { authUrl: login.authUrl }
-      } catch {
+      } catch (error) {
+        if (this.closing || this.chatgpt !== service) throw error
         const login = await service.startDeviceCodeLogin()
+        if (this.closing || this.chatgpt !== service) {
+          await service.close().catch(() => undefined)
+          throw new Error('应用正在退出，ChatGPT 登录已取消')
+        }
         await this.options.openExternal(login.verificationUrl)
         void this.finishChatGptLogin(service, login.loginId)
         return { authUrl: login.verificationUrl, userCode: login.userCode }
@@ -617,7 +821,62 @@ export class AppController extends EventEmitter<ControllerEvents> {
     }
   }
 
+  private async restoreExistingChatGptSession(): Promise<void> {
+    if (this.closing) return
+    const existingStatus = this.chatgpt?.getStatus()
+    if (existingStatus?.authenticated && existingStatus.warmedUp) return
+    await this.closeChatGptService()
+    if (this.closing) return
+
+    this.setConnection('chatgpt', 'connecting', '正在恢复已保存的 ChatGPT 登录')
+    const service = this.createChatGptService()
+    this.chatgpt = service
+    try {
+      await service.start()
+      if (this.closing || this.chatgpt !== service) {
+        await service.close().catch(() => undefined)
+        return
+      }
+      const status = service.getStatus()
+      if (!status.authenticated) {
+        this.settings = await this.settingsStore.setFlags({ chatgptConfigured: false })
+        throw new Error('已保存的 ChatGPT 登录已失效')
+      }
+      if (!status.warmedUp) throw new Error('已保存的 ChatGPT 登录未完成模型预热')
+      this.settings = await this.settingsStore.setFlags({ chatgptConfigured: true })
+      this.unsubscribeChatGptStatus = service.onStatus((nextStatus) =>
+        this.handleChatGptStatus(nextStatus)
+      )
+      this.handleChatGptStatus(status)
+      await this.audit.write('chatgpt_connected', 'info', {
+        model: status.selectedModel,
+        restoredAtStartup: true
+      })
+    } catch (error) {
+      if (this.closing || this.chatgpt !== service) return
+      if (this.chatgpt === service) {
+        await this.closeChatGptService()
+        this.setConnection(
+          'chatgpt',
+          'error',
+          '已保存的 ChatGPT 登录无法恢复，请手动重新登录'
+        )
+      }
+      throw error
+    }
+  }
+
+  private createChatGptService(): ChatGptService {
+    const serviceOptions: ChatGptServiceOptions = {
+      proxyUrl: proxyUrlForChild(this.settings.proxy),
+      timeoutMs: this.settings.trading.aiTimeoutMs,
+      cwd: path.resolve(this.options.userDataDirectory, '..')
+    }
+    return this.options.createChatGptService?.(serviceOptions) ?? new ChatGptService(serviceOptions)
+  }
+
   async disconnectChatGpt(): Promise<void> {
+    this.startupMonitoringAllowed = false
     const service = this.chatgpt
     if (service) await service.logout().catch(() => undefined)
     await this.closeChatGptService()
@@ -630,6 +889,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async saveOkxCredentials(raw: OkxCredentialsInput): Promise<void> {
+    this.startupMonitoringAllowed = false
     // Credential replacement is a high-risk lifecycle boundary. Revoke every
     // opening capability before the mutex can yield, including when a close or
     // another lifecycle action is already ahead in the queue.
@@ -695,15 +955,27 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async connectOkx(): Promise<void> {
+    this.startupMonitoringAllowed = false
+    return this.connectOkxWithLifecycle()
+  }
+
+  private connectOkxWithLifecycle(): Promise<void> {
+    if (this.closing) throw new Error('应用正在退出，不能连接 OKX')
     this.reserveOkxLifecycleChange()
-    return this.okxLifecycleMutex.runExclusive(() => this.connectOkxUnlocked())
+    return this.okxLifecycleMutex.runExclusive(() => {
+      this.assertOkxConnectionAllowed()
+      return this.connectOkxUnlocked()
+    })
   }
 
   private async connectOkxUnlocked(): Promise<void> {
+    this.assertOkxConnectionAllowed()
     if (this.mutationJournalFailure) throw new Error(this.mutationJournalFailure)
     const credentials = await this.readJsonSecret<OkxCredentialsInput>(OKX_CREDENTIALS_KEY)
+    this.assertOkxConnectionAllowed()
     if (!credentials) throw new Error('请先保存 OKX 子账户 API 凭据')
     await this.disconnectOkxUnlocked()
+    this.assertOkxConnectionAllowed()
     this.setConnection('okx', 'connecting', '正在连接 OKX 并校验子账户')
     let client!: OkxV5Client
     client = (this.options.createOkxClient ?? ((options) => new OkxV5Client(options)))({
@@ -714,6 +986,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.okx = client
     try {
       let verification = await client.verifyAccountConfiguration()
+      this.assertOkxConnectionAllowed()
       this.rememberOkxVerificationExposure(verification)
       this.captureOkxRoutes(client)
       await this.auditOkxRoute('rest', this.okxRoutes.rest)
@@ -721,10 +994,12 @@ export class AppController extends EventEmitter<ControllerEvents> {
       this.okxAccountFingerprints.set(client, accountFingerprint)
       const hadRecoveredMutations = this.durableMutations.length > 0
       await this.recoverDurableMutations(client, verification, accountFingerprint)
+      this.assertOkxConnectionAllowed()
       if (hadRecoveredMutations && this.durableMutations.length === 0) {
         // Recovery may have consumed a terminal order that appeared pending in
         // the first snapshot. Re-run the complete fail-closed exposure check.
         verification = await client.verifyAccountConfiguration()
+        this.assertOkxConnectionAllowed()
         this.rememberOkxVerificationExposure(verification)
       }
       if (!verification.ok) throw new Error(verification.errors.join('；'))
@@ -733,8 +1008,10 @@ export class AppController extends EventEmitter<ControllerEvents> {
         client.getInstruments(),
         this.refreshPositions(client)
       ])
+      this.assertOkxConnectionAllowed()
       this.okxInstruments = instruments
       await this.refreshPositions(client)
+      this.assertOkxConnectionAllowed()
       const stream = client.createPrivateStream()
       stream.on('orders', (orders: OkxOrderUpdate[]) => {
         void this.handleOkxOrders(orders).catch((error) => {
@@ -785,9 +1062,11 @@ export class AppController extends EventEmitter<ControllerEvents> {
       })
       this.okxStream = stream
       await stream.connect()
+      this.assertOkxConnectionAllowed()
       this.captureOkxRoutes(client)
       await this.auditOkxRoute('private_ws', this.okxRoutes.privateWs)
       await this.reconcileTrackedOrders(client, 'initial_connect')
+      this.assertOkxConnectionAllowed()
       this.updateOkxExposureStatusAfterConnectedVerification(client, verification)
       this.lastError = undefined
       this.setConnection(
@@ -822,6 +1101,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async disconnectOkx(): Promise<void> {
+    this.startupMonitoringAllowed = false
     this.reserveOkxLifecycleChange()
     return this.okxLifecycleMutex.runExclusive(() => this.disconnectOkxUnlocked())
   }
@@ -848,7 +1128,12 @@ export class AppController extends EventEmitter<ControllerEvents> {
     )
   }
 
+  private assertOkxConnectionAllowed(): void {
+    if (this.closing) throw new Error('应用正在退出，不能连接 OKX')
+  }
+
   async updateSettings(raw: SettingsUpdateInput): Promise<void> {
+    this.startupMonitoringAllowed = false
     const input = settingsUpdateSchema.parse(raw)
     const prior = this.settings
     this.settings = await this.settingsStore.update(input)
@@ -892,6 +1177,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async startMonitoring(): Promise<void> {
+    this.startupMonitoringAllowed = false
     if (this.monitoring) return
     if (this.connectionBlockers().length) throw new Error(this.connectionBlockers().join('；'))
     const priorEmergencyStopped = this.emergencyStopped
@@ -919,6 +1205,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async stopMonitoring(reason = '用户停止监听'): Promise<void> {
+    if (reason === '用户停止监听') this.startupMonitoringAllowed = false
     const wasMonitoring = this.monitoring
     this.monitoringRevision += 1
     this.monitoring = false
@@ -1028,6 +1315,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
   }
 
   async emergencyStop(): Promise<void> {
+    this.startupMonitoringAllowed = false
     this.monitoringRevision += 1
     this.monitoring = false
     this.emergencyStopped = true
@@ -1256,19 +1544,30 @@ export class AppController extends EventEmitter<ControllerEvents> {
   async dispose(): Promise<void> {
     if (this.closing) return
     this.closing = true
+    this.startupMonitoringAllowed = false
     this.monitoringRevision += 1
     this.monitoring = false
     this.invalidateOkxOpeningCapability()
+    const startupOkxConnectionTask = this.startupOkxConnectionTask
+    this.telegramConnectTask = undefined
+    this.telegramConnectTaskIsStartup = false
+    this.telegramLifecycleRevision += 1
+    const telegram = this.telegram
+    this.telegram = undefined
+    telegram?.cancelAuthentication?.('应用正在关闭')
+    await telegram?.stop().catch(() => undefined)
+    await this.closeChatGptService()
+    // Telegram stop is intentionally bounded. Its obsolete start Promise can
+    // remain pending without ownership, so shutdown must not wait for it (or
+    // for the aggregate startup Promise that contains it). OKX can still
+    // install a private stream late, so wait only for that owned startup task
+    // before capturing and disconnecting the final client/stream below.
+    await startupOkxConnectionTask?.catch(() => undefined)
     const client = this.okx
     const stream = this.okxStream
-    await this.telegram?.stop().catch(() => undefined)
     await this.coordinator.finalizePendingRecoveryObservations(
       '应用已关闭，等待连续性校验的消息未进入 AI 分析'
     ).catch(() => undefined)
-    if (this.telegram) {
-      this.telegram = undefined
-      this.telegramLifecycleRevision += 1
-    }
     await this.coordinator.shutdown()
     await this.activePositionClose?.catch(() => undefined)
     if (client) {
@@ -1281,7 +1580,6 @@ export class AppController extends EventEmitter<ControllerEvents> {
     this.closeReconciliationTimer = undefined
     this.okxStream = undefined
     await this.trackedOrderReconciliation?.catch(() => undefined)
-    await this.closeChatGptService()
     await this.audit.write('application_stopped', 'info', {
       pendingOpenOrder: this.coordinator.hasPendingOrder,
       pendingCloseCount: this.pendingPositionCloses.size
@@ -1304,8 +1602,32 @@ export class AppController extends EventEmitter<ControllerEvents> {
     }
   }
 
-  private handleTelegramStatus(source: TelegramMonitor, status: TelegramStatusEvent): void {
+  private handleTelegramStatus(
+    source: TelegramMonitor,
+    status: TelegramStatusEvent,
+    genericDuringStartup = false
+  ): void {
     if (this.closing || this.telegram !== source) return
+    const statusDetail = genericDuringStartup && status.state === 'error'
+      ? 'Telegram 自动连接未完成，请检查已保存配置、网络与代理后重试'
+      : status.detail
+    if (status.state === 'reconnecting') {
+      if (!this.telegramReconnectSystemNotified) {
+        this.telegramReconnectSystemNotified = true
+        this.showSystemNotification(
+          'Telegram 正在自动重连',
+          '检测到 Telegram 连接中断，正在自动恢复；恢复前不会进行实盘下单'
+        )
+      }
+    } else if (
+      status.state === 'connected' ||
+      status.state === 'error' ||
+      status.state === 'idle' ||
+      status.state === 'stopping' ||
+      status.state === 'stopped'
+    ) {
+      this.telegramReconnectSystemNotified = false
+    }
     if (status.state === 'connected' && !source.liveTradingReadiness.ready) {
       void this.disarmLiveTrading(
         'Telegram 报告已连接但恢复门禁尚未就绪，已保持锁定；请重新连接并人工确认实盘'
@@ -1323,7 +1645,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
     if (newlySuspendedRetainedArm) {
       this.telegramReconnectRetainedArm = true
     } else if (status.state !== 'connected' && status.state !== 'reconnecting') {
-      const detail = status.detail ? `（${status.detail}）` : ''
+      const detail = statusDetail ? `（${statusDetail}）` : ''
       void this.disarmLiveTrading(
         `Telegram 状态变为 ${status.state}${detail}，已锁定实盘；连接恢复后需人工重新确认`
       ).catch(() => undefined)
@@ -1335,7 +1657,7 @@ export class AppController extends EventEmitter<ControllerEvents> {
         this.liveArmed &&
         Boolean(this.liveArmCapability)
       this.telegramReconnectRetainedArm = false
-      this.setConnection('telegram', 'connected', status.detail ?? '频道连接正常')
+      this.setConnection('telegram', 'connected', statusDetail ?? '频道连接正常')
       if (resumedRetainedArm) {
         void this.audit.write('telegram_reconnect_live_resumed', 'warning', {
           monitoringRevision: this.monitoringRevision,
@@ -1353,11 +1675,11 @@ export class AppController extends EventEmitter<ControllerEvents> {
       status.state === 'authenticating' ||
       status.state === 'reconnecting'
     ) {
-      this.setConnection('telegram', 'connecting', status.detail ?? status.state)
+      this.setConnection('telegram', 'connecting', statusDetail ?? status.state)
     } else if (status.state === 'error') {
-      this.setConnection('telegram', 'error', status.detail ?? '连接异常')
+      this.setConnection('telegram', 'error', statusDetail ?? '连接异常')
     } else {
-      this.setConnection('telegram', 'disconnected', status.detail ?? status.state)
+      this.setConnection('telegram', 'disconnected', statusDetail ?? status.state)
     }
     if (newlySuspendedRetainedArm) {
       void this.audit.write('telegram_reconnect_live_suspended', 'warning', {
@@ -1377,14 +1699,18 @@ export class AppController extends EventEmitter<ControllerEvents> {
 
   private async handleTelegramError(
     source: TelegramMonitor,
-    event: TelegramMonitorError
+    event: TelegramMonitorError,
+    genericDuringStartup = false
   ): Promise<void> {
     if (this.closing || this.telegram !== source) return
+    const detail = genericDuringStartup
+      ? 'Telegram 自动连接期间发生通信异常，请检查已保存配置、网络与代理后重试'
+      : event.message
     // Recoverable teleproto errors are diagnostic signals only. Confirmed
     // transport changes are published through handleTelegramStatus(), which
     // remains the single authority that suspends or revokes live trading.
     if (!event.recoverable) {
-      this.lastError = event.message
+      this.lastError = detail
       await this.disarmLiveTrading(
         'Telegram 发生不可恢复错误，已锁定实盘；恢复后需人工重新确认'
       ).catch(() => undefined)
@@ -1398,8 +1724,8 @@ export class AppController extends EventEmitter<ControllerEvents> {
       event.recoverable ? 'warning' : 'error',
       event.recoverable ? 'Telegram 瞬时通信异常' : 'Telegram 连接异常',
       event.recoverable
-        ? `${event.message}；程序将通过连续健康检查确认是否真的断线`
-        : event.message
+        ? `${detail}；程序将通过连续健康检查确认是否真的断线`
+        : detail
     )
   }
 
@@ -2785,15 +3111,19 @@ export class AppController extends EventEmitter<ControllerEvents> {
       createdAt: this.now()
     }
     this.notifications = [item, ...this.notifications].slice(0, MAX_NOTIFICATION_HISTORY)
-    if (this.settings.notificationsEnabled) {
-      try {
-        this.options.showDesktopNotification?.(title, detail)
-      } catch {
-        // Desktop notification failures do not affect the trading state.
-      }
-    }
     this.emit('event', { type: 'notification', payload: item })
     this.emitSnapshot()
+  }
+
+  private showSystemNotification(title: string, detail: string): void {
+    if (!this.settings.notificationsEnabled) return
+    try {
+      void Promise.resolve(
+        this.options.showDesktopNotification?.(title, detail)
+      ).catch(() => undefined)
+    } catch {
+      // System notification failures do not affect the trading state.
+    }
   }
 
   private emitSnapshot(): void {

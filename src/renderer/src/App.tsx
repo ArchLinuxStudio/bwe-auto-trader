@@ -64,7 +64,7 @@ const EMPTY_SETTINGS: PublicSettings = {
 }
 
 const EMPTY_SNAPSHOT: AppSnapshot = {
-  version: '0.1.9',
+  version: '0.1.10',
   connections: {
     telegram: EMPTY_STATUS,
     chatgpt: EMPTY_STATUS,
@@ -1216,7 +1216,7 @@ function SettingsView({
             <div className="toggle-grid span-full">
               <Toggle
                 label="桌面通知"
-                description="下单、跳过与错误状态"
+                description="频道消息、Telegram 重连、AI 分析与下单操作"
                 checked={settings.notificationsEnabled}
                 onChange={(checked) => setSettings((current) => ({ ...current, notificationsEnabled: checked }))}
               />

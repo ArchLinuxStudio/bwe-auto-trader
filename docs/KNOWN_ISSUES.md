@@ -14,7 +14,7 @@ Current mitigation in `v0.1.8`: The application performs a four-second-bounded t
 
 Additional mitigation in `v0.1.9`: A confirmed recoverable network outage keeps the existing manual arm only as suspended same-monitor intent. Failed reconnects are retried on later health cycles; readiness stays closed, old message tokens are invalidated, and catch-up messages remain permanently non-trading. The final `connected` event is emitted only after readiness is actually open, at which point later new live messages can use the retained arm. The final authorization check calls `updates.getState` directly so network/timeout failures remain recoverable; only an explicit teleproto `UnauthorizedError`/`AuthKeyError` is fatal, stops retry, and revokes the arm. Status/error/message callbacks are monitor-identity guarded so a stopped instance cannot lock or resume its replacement, and the saved-config connect action retires an errored/stopped instance before replacement. Injected tests cover two failed connects followed by success, both authorization-probe error classes, errored-monitor replacement, and controller token behavior, but no private Telegram/proxy interruption has been exercised.
 
-Next direction: After installing the reviewed `v0.1.9` package, repeat a user-supervised Telegram/ChatGPT-only test. Measure channel publication, timeline `received`, and AI `analyzing` times, then temporarily interrupt and restore the network while live ordering remains prohibited. Retain only aggregate timing/state behavior; never record credentials, session data, message contents, or personal network details. Keep the issue open until both low-latency receipt and repeated automatic reconnect are verified in the real environment.
+Next direction: After installing the reviewed `v0.1.10` package or a later reviewed build, repeat a user-supervised Telegram/ChatGPT-only test. Measure channel publication, timeline `received`, and AI `analyzing` times, then temporarily interrupt and restore the network while live ordering remains prohibited. Retain only aggregate timing/state behavior; never record credentials, session data, message contents, or personal network details. Keep the issue open until both low-latency receipt and repeated automatic reconnect are verified in the real environment.
 
 ## Dynamic ChatGPT quota refresh needs authenticated verification
 
@@ -26,19 +26,9 @@ Current workaround: The UI labels the value as updated every minute and retains 
 
 Next direction: Follow the dedicated P1 item in `TODO.md`, observe at least two poll cycles without relogin, and record only non-sensitive results.
 
-## Concurrent Telegram connect requests are not main-process single-flight
-
-Symptoms: Two non-UI callers that invoke `connectTelegram()` at nearly the same time can both pass the initial empty-monitor check while the encrypted credential read is pending, then construct competing monitor instances.
-
-Impact: The normal renderer serializes the connect action and monitor-identity guards prevent a stale instance from authorizing messages or mutating the active controller state, so this is not a live-order authorization bypass. A synthetic concurrent caller could still create redundant transport work until the losing instance settles.
-
-Current workaround: Use the existing renderer action, do not invoke duplicate connect IPC calls, and rely on the identity guards plus bounded stop when replacing an errored/stopped monitor.
-
-Next direction: Add a main-process Telegram connect single-flight or lifecycle reservation before the first credential-read await, with tests for concurrent connect, disconnect-during-connect, and late loser cleanup.
-
 ## Cross-client unknown may remain locked indefinitely
 
-Symptoms: If the client that originated an ambiguous mutation is gone—including after process restart—the durable record remains locked when a replacement client sees no matching order. A position effect without an exact matching terminal order is recorded as evidence but also does not release the recovered record. While any recovered record remains unresolved, the explicit connection attempt fails before creating the private WebSocket, so the application does not continuously observe that order's later terminal state.
+Symptoms: If the client that originated an ambiguous mutation is gone—including after process restart—the durable record remains locked when a replacement client sees no matching order. A position effect without an exact matching terminal order is recorded as evidence but also does not release the recovered record. While any recovered record remains unresolved, an automatic or manual full connection attempt fails before creating the private WebSocket, so the application does not continuously observe that order's later terminal state.
 
 Impact: Automation can remain safely unavailable until a human establishes the exchange outcome.
 
@@ -52,7 +42,7 @@ Next direction: Implement the collection-only, recovery-stream portion of the ac
 
 ## No real private-service end-to-end verification
 
-Symptoms: All automated tests use mocks/injected transports. Windows build/cold-start verification proves packaging and startup, not Telegram delivery, ChatGPT account behavior, or an OKX real order lifecycle.
+Symptoms: All automated tests use mocks/injected transports. Windows build/cold-start verification proves packaging and process startup, not Telegram delivery, ChatGPT account behavior, OKX private connectivity, saved-configuration restoration against real services, or an OKX real order lifecycle.
 
 Impact: The first real approximately 10 USDT order and close may expose integration behavior not represented by mocks.
 
@@ -62,7 +52,7 @@ Next direction: Follow the corresponding private-service P1 item in `TODO.md` an
 
 ## Not suitable for unattended operation
 
-Symptoms: There is no automatic stop loss, take profit, maximum holding time, time-based close, autostart/headless supervision, or exit-time close. Emergency stop and application exit do not close an existing position. Hiding the window to the tray keeps the existing process and live state running; it does not add unattended-operation safeguards.
+Symptoms: There is no automatic stop loss, take profit, maximum holding time, time-based close, operating-system login autostart, headless supervision, or exit-time close. Opening the application can restore valid saved connections and start monitoring after all three services connect, but this does not create live authorization or add unattended-operation safeguards. Emergency stop and application exit do not close an existing position. Hiding the window to the tray keeps the existing process and live state running.
 
 Impact: Exposure can remain after the application stops or the signal pipeline becomes unavailable.
 
@@ -108,7 +98,7 @@ Next direction: Improve the notification without removing lifecycle revocation.
 
 Symptoms: Windows reports the application and installer as `NotSigned`; SmartScreen may warn. The bundled OpenAI Codex executable may have a valid upstream signature, but that does not sign this application.
 
-Current state: `v0.1.9` defines a custom BWE application icon, and Windows package inspection confirmed that the application EXE and NSIS installer both embed it. The historical `v0.1.8` assets remain immutable and retain the default Electron icon.
+Current state: `v0.1.9` and the reviewed `v0.1.10` Windows artifacts use the custom BWE application icon. The `v0.1.10` application EXE and NSIS installer remain `NotSigned`. The historical `v0.1.8` assets remain immutable and retain the default Electron icon.
 
 Impact: The custom icon improves application identity, but the package still has lower installation trust until publisher signing is configured.
 
@@ -116,13 +106,23 @@ Current workaround: Verify the release SHA-256 values in `CURRENT_STATE.md`/`SHA
 
 Next direction: Add project publisher signing before treating distribution as polished.
 
+## Selected system notifications need packaged Windows verification
+
+Symptoms: Injected tests verify selection, reconnect-episode deduplication, notification-setting suppression, privacy-safe text, and delivery-failure isolation. This task has not yet observed the resulting native Windows toast or click-to-restore behavior from either the installed NSIS package or the Portable ZIP. Operating-system notification permissions and focus modes may suppress display even when Electron reports notification support.
+
+Impact: The in-application signal timeline and notification history remain authoritative. A hidden-window user must not treat receipt of—or failure to receive—a system notification as proof of Telegram continuity, AI execution, OKX submission, or order state.
+
+Current workaround: Keep desktop notifications enabled when desired, but verify all trading state in the application and OKX. The four system notification bodies intentionally omit channel and trade details.
+
+Next direction: Test the reviewed `v0.1.10` NSIS and Portable packages separately while hidden to tray, including click restoration, one-per-outage reconnect behavior, disabled-notification suppression, and an injected order-start event that makes no private-service call.
+
 ## Telegram and content support is intentionally narrow
 
 Symptoms:
 
 - Only text and caption-like message content is analyzed; images, OCR, linked pages, and attachments are not fetched.
 - Standard phone number, code, and 2FA password prompts are implemented. Rare email-code or CAPTCHA flows are not.
-- Monitoring exists only while the application process is open and the user starts it; a window hidden to the tray still counts as open.
+- Monitoring exists only while the application process is open. When all three valid saved configurations restore successfully at startup it begins automatically; otherwise the user must complete the connections and start it manually. A window hidden to the tray still counts as open.
 
 Impact: Some posts or unusual login flows are safely skipped or fail instead of being analyzed/bypassed.
 

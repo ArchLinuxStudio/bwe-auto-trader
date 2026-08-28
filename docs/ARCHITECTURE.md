@@ -6,7 +6,7 @@ This document contains stable system structure and safety boundaries. Current re
 
 BWE Auto Trader is a local-first Electron desktop application that:
 
-1. Uses the user's personal Telegram MTProto account to monitor `@BWEnews` while the application is open and monitoring is manually enabled.
+1. Uses the user's personal Telegram MTProto account to monitor `@BWEnews` while the application is open. Monitoring starts automatically only when startup restores all three configured services successfully; otherwise it remains a manual action.
 2. Uses the user's ChatGPT Plus/Codex login to classify each accepted text message as one coin and `LONG`, `SHORT`, or `SKIP` under a strict deadline.
 3. Can open a small OKX USDT perpetual-swap position only after the user explicitly arms live trading and every main-process safety gate still passes.
 4. Displays every SWAP position in the dedicated OKX sub-account and provides an explicitly confirmed, whole-position `reduceOnly` market close.
@@ -43,7 +43,7 @@ The renderer has no Node integration or direct network authority. UI disabled st
 
 | Path | Responsibility |
 |---|---|
-| `src/main/index.ts` | Electron lifecycle, single-instance/tray behavior, window hardening, CSP, trusted external URLs, IPC installation, and orderly shutdown |
+| `src/main/index.ts` | Electron lifecycle, single-instance/tray behavior, native system-notification delivery, window hardening, CSP, trusted external URLs, IPC installation, and orderly shutdown |
 | `src/main/window-tray.ts` | Pure hide/reveal helpers, stable tray-menu actions, and the asynchronous shutdown coordinator |
 | `src/main/ipc.ts` | Trusted renderer validation, IPC argument schemas, public error compression, and the controller facade |
 | `src/main/app-controller.ts` | Global connection/safety state machine, lifecycle mutex, credentials boundary, live capability, positions, manual close, reconciliation, notifications, and snapshots |
@@ -66,20 +66,23 @@ The renderer has no Node integration or direct network authority. UI disabled st
 
 ## Startup and connection lifecycle
 
-- Application initialization loads public settings and starts every external connection as disconnected or not configured.
-- Restart never restores live authorization, starts monitoring, or automatically connects Telegram, ChatGPT, or OKX.
-- Startup loads the mutation journal before IPC use. A `prepared` entry can be removed because the transport protocol requires a later durable `transmitting` commit before fetch; every later state remains locked until read-only evidence is conclusive.
-- Telegram, ChatGPT, and OKX connections are independently user initiated.
-- An explicit OKX connection first matches the journal's hashed account UID, then performs GET-only recovery. A recovered new client never applies the originating client's timed absence rule.
+- Application initialization loads public settings and the mutation journal before starting external-service restoration. A `prepared` journal entry can be removed because the transport protocol requires a later durable `transmitting` commit before fetch; every later state remains locked until read-only evidence is conclusive.
+- After the main window, IPC, and tray lifecycle are ready, the main process independently attempts Telegram, ChatGPT, and OKX connection for each service whose saved configuration marker exists. Failure of one attempt does not cancel or roll back the other attempts, and errors expose only non-sensitive retry guidance.
+- Telegram connect is main-process single-flight across startup and renderer callers. Disconnect, shutdown, or a newer lifecycle revision cancels ownership of the in-flight attempt; a late monitor cannot replace current state or trading authorization.
+- Telegram and OKX configuration markers are only entry conditions for reading their encrypted records through the owning store. Missing, malformed, or undecryptable data fails that service closed. The persisted ChatGPT marker is weaker still: it is only a startup-attempt hint; current Codex app-server account/authentication state, model warm-up, and bounded reads remain authoritative, and an invalid saved session clears the hint instead of being treated as connected.
+- Startup opens monitoring only when all three configuration markers were present at the beginning of restoration and Telegram, ChatGPT, and OKX all finish in `connected`. A user settings, connect/disconnect, monitoring, emergency-stop, or shutdown action cancels that one-time automatic-monitoring intent. Partial success leaves successfully restored services connected but monitoring stopped.
+- Restart never restores, persists, or creates live authorization. Startup connection and monitoring therefore remain display/analysis-only until the user enters the exact live confirmation phrase in that process. Startup Telegram catch-up remains `recovered` and permanently non-trading.
+- An automatic or manual OKX connection uses the same account-bound, fail-closed path: it first matches the journal's hashed account UID, then performs GET-only recovery. A recovered new client never applies the originating client's timed absence rule, never replays a mutation, and never treats negative evidence as permission to arm.
 - `AppController` serializes OKX credential, account, and trading lifecycle operations with a FIFO mutex. Safety actions can revoke capability synchronously before awaited audit or UI work.
 - Snapshots are emitted from the main process and contain only public state.
 - Once startup is complete and a usable native tray exists, a title-bar close hides the existing main window instead of destroying it. Tray activation, the show menu item, a second instance, and macOS activation all restore or recreate the same main window path.
-- Hiding is not a service-lifecycle event: the controller, manually started monitoring, connections, and any current live authorization continue unchanged. Only explicit application quit starts IPC removal and controller disposal; repeated quit requests remain blocked until that asynchronous cleanup finishes.
+- Hiding is not a service-lifecycle event: the controller, current monitoring, connections, and any current live authorization continue unchanged. Only explicit application quit starts IPC removal and controller disposal; repeated quit requests remain blocked until that asynchronous cleanup finishes.
 - If a usable tray cannot be created, Windows/Linux retain normal close-to-exit behavior so the application cannot become unreachable. Native tray behavior is a platform-specific integration and does not transfer release verification between operating systems.
+- Program-internal notices and system notifications are separate main-process channels. Only channel receipt, confirmed Telegram reconnect entry, AI-analysis start, and order-submission start use the system channel. Their bodies intentionally omit channel content and trade details, delivery is best-effort, and an OS notification can never grant authorization, prove execution, or alter signal/order state. Clicking a delivered notification requests the same guarded window-restoration path used by the tray and second-instance events.
 
 ## Signal-to-order data flow
 
-1. The user manually connects all services, starts monitoring, and enters the exact live confirmation phrase.
+1. The application either restores all configured services and starts monitoring under the startup rules above, or the user completes those actions manually. In both cases the user must enter the exact live confirmation phrase in the current process before any message can gain open-order authority.
 2. The raw teleproto `NewMessage` handler synchronously captures the current process-local authorization token before FIFO or asynchronous dispatch.
 3. Telegram validates channel/message data, deduplicates it, and queues it. A bounded five-second target-channel cursor probe independently detects a post that the live update stream did not deliver. Startup/reconnect/cursor-gap catch-up messages carry `recovered=true` permanently.
 4. If a raw live update or cursor-probe result is held behind startup/recovery verification, Telegram emits a separate no-token, `recovered=true` observation after it is successfully buffered. `SignalCoordinator` may publish only a `received` record for immediate renderer visibility; this path neither starts AI nor consumes canonical message state.

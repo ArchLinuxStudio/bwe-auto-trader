@@ -59,7 +59,10 @@ const startupTask = app.whenReady().then(async () => {
     version: app.getVersion(),
     openExternal: openTrustedAuthUrl,
     showDesktopNotification: (title, body) => {
-      if (Notification.isSupported()) new Notification({ title, body, silent: false }).show()
+      if (!Notification.isSupported()) return
+      const notification = new Notification({ title, body, silent: false })
+      notification.on('click', () => requestShowOrCreateMainWindow())
+      notification.show()
     }
   })
   controller = nextController
@@ -79,6 +82,7 @@ const startupTask = app.whenReady().then(async () => {
   createTray()
   applicationInitialized = true
   revealTrayWindow(window)
+  void nextController.restoreConfiguredServices().catch(() => undefined)
 })
 
 void startupTask.catch((error) => {

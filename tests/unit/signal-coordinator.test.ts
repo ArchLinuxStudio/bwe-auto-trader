@@ -80,6 +80,7 @@ function harness(overrides: {
     overrides.analysis ?? analysis()
   )
   const notices: string[] = []
+  const systemNotices: Array<{ title: string; detail: string }> = []
   const coordinator = new SignalCoordinator({
     now: () => now,
     settings: () => settings,
@@ -90,6 +91,9 @@ function harness(overrides: {
     onRecord: () => undefined,
     onNotice: ({ title }) => {
       notices.push(title)
+    },
+    onSystemNotice: (notice) => {
+      systemNotices.push(notice)
     }
   })
   return {
@@ -98,6 +102,7 @@ function harness(overrides: {
     analyze,
     safety,
     notices,
+    systemNotices,
     now: () => now,
     advance: (milliseconds: number) => {
       now += milliseconds
@@ -133,6 +138,52 @@ describe('SignalCoordinator', () => {
       instrumentId: 'ABC-USDT-SWAP',
       clientOrderId: 'bwe-client-1'
     })
+    expect(test.systemNotices).toEqual([
+      {
+        title: '收到频道消息',
+        detail: '已收到一条频道消息，请在程序内查看详情'
+      },
+      {
+        title: 'AI 开始分析频道消息',
+        detail: '正在分析最新收到的频道消息，请在程序内查看进度'
+      },
+      {
+        title: '正在进行下单操作',
+        detail: '已进入订单提交流程，请在程序内查看状态'
+      }
+    ])
+    expect(test.systemNotices.some(({ detail }) => detail.includes('Coinbase will list ABC'))).toBe(false)
+  })
+
+  it('keeps signal processing independent from system-notification failures', async () => {
+    const safety = armedSafety()
+    const openTrade = vi.fn(async () => ({
+      instrumentId: 'ABC-USDT-SWAP',
+      orderId: 'order-1',
+      clientOrderId: 'bwe-client-1'
+    }))
+    let noticeCount = 0
+    const onSystemNotice = vi.fn(() => {
+      noticeCount += 1
+      if (noticeCount === 1) throw new Error('native notification failed')
+      return Promise.reject(new Error('native notification rejected'))
+    })
+    const coordinator = new SignalCoordinator({
+      now: () => 1_000,
+      settings: () => settings,
+      safety: () => safety,
+      analyze: async () => analysis(),
+      readPositions: async () => [],
+      openTrade,
+      onRecord: () => undefined,
+      onSystemNotice
+    })
+
+    await expect(coordinator.process(message(1_000), safety.authorizationToken)).resolves.toMatchObject({
+      stage: 'submitted'
+    })
+    expect(onSystemNotice).toHaveBeenCalledTimes(3)
+    expect(openTrade).toHaveBeenCalledOnce()
   })
 
   it('deduplicates the same Telegram channel/message pair', async () => {
@@ -561,6 +612,7 @@ describe('SignalCoordinator', () => {
     }))
     const openTrade = vi.fn()
     const publishedStages: string[] = []
+    const systemNotices: Array<{ title: string; detail: string }> = []
     const coordinator = new SignalCoordinator({
       now: () => 1_000,
       settings: () => settings,
@@ -570,6 +622,9 @@ describe('SignalCoordinator', () => {
       openTrade,
       onRecord: (record) => {
         publishedStages.push(record.stage)
+      },
+      onSystemNotice: (notice) => {
+        systemNotices.push(notice)
       }
     })
     const observed = message(1_000, 502)
@@ -601,6 +656,9 @@ describe('SignalCoordinator', () => {
     })
     expect(coordinator.history).toHaveLength(1)
     expect(openTrade).not.toHaveBeenCalled()
+    expect(systemNotices.filter(({ title }) => title === '收到频道消息')).toHaveLength(1)
+    expect(systemNotices.filter(({ title }) => title === 'AI 开始分析频道消息')).toHaveLength(1)
+    expect(systemNotices.some(({ detail }) => detail.includes(observed.text))).toBe(false)
 
     await expect(coordinator.process(canonical, safety.authorizationToken)).resolves.toBeUndefined()
     expect(analyze).toHaveBeenCalledOnce()

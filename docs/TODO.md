@@ -16,8 +16,17 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
     - Confirm logout stops polling and quota recovery does not automatically re-arm live trading.
   - Done when the authenticated UI changes without reconnecting and only non-sensitive timing/value behavior is recorded in `docs/CURRENT_STATE.md`.
 
+- [ ] Re-verify saved-configuration startup restoration with real services, without arming or ordering.
+  - Dependency: Use the reviewed `v0.1.10` Windows package or a later reviewed build. Codex must not access a private Telegram session, ChatGPT login, or OKX account without explicit authorization in that current Thread; a real order is outside this check.
+  - Scope:
+    - Confirm an application opened with all three valid saved configurations independently restores Telegram, ChatGPT, and OKX, then starts monitoring only after all three are fully connected.
+    - Confirm a missing, invalid, expired, or temporarily failing service does not cancel the other configured attempts and prevents automatic monitoring for that startup.
+    - Confirm the persisted ChatGPT flag is only an attempt hint and an expired session is rejected by current app-server account/read state.
+    - Confirm startup and any recovered Telegram messages remain non-trading, `liveArmed` remains false, and an unresolved OKX journal record retains its existing fail-closed interlock.
+  - Done when only non-sensitive connection/state results are recorded and no service restoration creates live authorization or submits a private mutation.
+
 - [ ] Re-verify Telegram target-channel receipt and AI-start latency in the user's real environment.
-  - Dependency: Use the reviewed `v0.1.9` Windows package or a later build. Codex must not access a private Telegram session or ChatGPT login without explicit authorization in that current Thread.
+  - Dependency: Use the reviewed `v0.1.10` Windows package or a later build. Codex must not access a private Telegram session or ChatGPT login without explicit authorization in that current Thread.
   - Scope:
     - Test several new channel posts after an idle period while the application remains visibly connected.
     - Compare the channel publication time with the first timeline `received` state and the first `analyzing` state; retain only non-sensitive aggregate timing.
@@ -64,10 +73,6 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
 
 ## P2 — Product and operational improvements
 
-- [ ] Serialize Telegram connect attempts in the main process.
-  - Relevant code: `src/main/app-controller.ts`.
-  - Done when a lifecycle reservation or single-flight prevents two concurrent `connectTelegram()` calls from constructing competing monitors, disconnect can cancel an in-flight connect, and a late loser is bounded-stopped without changing connection state or trading authorization.
-
 - [ ] Display unresolved-operation provenance from the durable mutation journal.
   - Dependency: Read the existing `mutation-journal.v1.json` through the main-process store; do not create a second provenance store or expose the hashed account identity.
   - Done when the UI reads journal state to expose `clOrdId`, operation type, last verified state, and a safe read-only reconciliation action without exposing credentials.
@@ -81,6 +86,11 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
 
 - [ ] Configure application publisher signing.
   - Done when Windows installer/application publisher signatures verify and the documented macOS targets have Developer ID signing/notarization when published.
+
+- [ ] Verify selected system notifications in packaged Windows distributions.
+  - Scope: Test the installed NSIS application and Portable ZIP separately because Windows notification identity and shortcut registration can differ.
+  - Done when channel receipt, one-per-outage Telegram reconnect, AI-analysis start, and order-submission start each produce one neutral OS notification while the window is hidden; clicking it restores the same window; disabling desktop notifications suppresses all four; ordinary in-app notices do not become global; and notification failure never changes signal or order state.
+  - Safety: Use injected/no-private-service events for the order path unless a separate task explicitly authorizes a real minimal-fund order. Do not treat toast visibility as execution evidence.
 
 - [ ] Add an explicit, redacted log export and reconciliation report.
   - Done when exported diagnostics exclude all configured secret/session/token fields and give the user enough `clOrdId`/route/lifecycle context to investigate an unknown order.
@@ -96,5 +106,5 @@ No known P0 for the current approximately 10 USDT, actively supervised, dedicate
 
 - [ ] If the user requests unattended operation or materially larger funds, design stop loss, take profit, maximum holding time, and exit-risk behavior as a separate safety project.
 - [ ] If the user requests images, links, web pages, or attachments, design provenance and content extraction before adding them to the classifier.
-- [ ] If the user requests autostart, a headless background service, or unattended operation beyond the accepted hide-to-tray behavior, redesign lifecycle, secure login availability, recovery, and user-visible risk controls first.
+- [ ] If the user requests operating-system login autostart, a headless background service, or unattended operation beyond the accepted hide-to-tray behavior, redesign lifecycle, secure login availability, recovery, and user-visible risk controls first. This is separate from restoring saved connections after the user opens the application.
 - [ ] If the user requires attribution between application and externally created positions, persist order provenance and reconcile external orders; do not infer ownership from the OKX position list.

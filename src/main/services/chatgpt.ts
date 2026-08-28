@@ -834,7 +834,7 @@ export class ChatGptService {
       clientInfo: {
         name: 'bwe_auto_trader',
         title: 'BWE Auto Trader',
-        version: '0.1.9',
+        version: '0.1.10',
       },
       capabilities: {
         optOutNotificationMethods: [
